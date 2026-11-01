@@ -3,4 +3,4 @@
 	url = https://github.com/musznik/protobufs.git
 [submodule "meshtestic"]
 	path = meshtestic
-	url = https://github.com/meshtastic/meshTestic
+	url = https://github.com/meshtastic/meshTestic.git
