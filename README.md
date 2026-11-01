@@ -57,3 +57,4 @@ Snapshot from 2026-11-01:
 
 - Fork description: [musznik](https://github.com/musznik/firmware) (FW+ / Meshtastic+, [loranet.pl](https://loranet.pl)).
 - Upstream firmware: the [Meshtastic](https://meshtastic.org) project and its contributors.
+- Board designs: [NanoVHF/Meshtastic-DIY](https://github.com/NanoVHF/Meshtastic-DIY/tree/main).
