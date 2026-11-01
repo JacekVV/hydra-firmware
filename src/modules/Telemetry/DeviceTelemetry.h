@@ -1,0 +1,71 @@
+#pragma once
+#include "../mesh/generated/meshtastic/telemetry.pb.h"
+#include "BaseTelemetryModule.h"
+#include "NodeDB.h"
+#include "ProtobufModule.h"
+#include <OLEDDisplay.h>
+#include <OLEDDisplayUi.h>
+#include "FSCommon.h"
+class DeviceTelemetryModule : private concurrency::OSThread,
+                              public BaseTelemetryModule,
+                              public ProtobufModule<meshtastic_Telemetry>
+{
+    CallbackObserver<DeviceTelemetryModule, const meshtastic::Status *> nodeStatusObserver =
+        CallbackObserver<DeviceTelemetryModule, const meshtastic::Status *>(this, &DeviceTelemetryModule::handleStatusUpdate);
+    CallbackObserver<DeviceTelemetryModule, void *> apiConfigObserver =
+        CallbackObserver<DeviceTelemetryModule, void *>(this, &DeviceTelemetryModule::handlePhoneApiConfigComplete);
+
+  public:
+    DeviceTelemetryModule();
+    virtual bool wantUIFrame() { return false; }
+
+
+  protected:
+    /** Called to handle a particular incoming message
+    @return true if you've guaranteed you've handled this message and no other handlers should be considered for it
+    */
+    virtual bool handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshtastic_Telemetry *p) override;
+    virtual meshtastic_MeshPacket *allocReply() override;
+    virtual int32_t runOnce() override;
+    /**
+     * Send our Telemetry into the mesh
+     */
+    bool sendTelemetry(NodeNum dest = NODENUM_BROADCAST, bool phoneOnly = false);
+
+    /**
+     * Get the uptime in seconds
+     * Loses some accuracy after 49 days, but that's fine
+     */
+    uint32_t getUptimeSeconds() { return (0xFFFFFFFF / 1000) * uptimeWrapCount + (uptimeLastMs / 1000); }
+
+  private:
+    meshtastic_Telemetry getDeviceTelemetry();
+    meshtastic_Telemetry getLocalStatsTelemetry();
+    meshtastic_Telemetry getLocalStatsExtendedTelemetry();
+
+
+    void sendLocalStatsToPhone();
+    void sendLocalStatsToMesh();
+    void sendLocalStatsExtendedToMesh();
+    int handlePhoneApiConfigComplete(void *arg);
+    uint32_t sendToPhoneIntervalMs = SECONDS_IN_MINUTE * 1000;           // Send to phone every minute
+    uint32_t sendStatsToPhoneIntervalMs = 1 * SECONDS_IN_MINUTE * 5000; // Send stats to phone every 5 minutes
+    uint32_t lastSentStatsToPhone = 0;
+    uint32_t lastSentToMesh = 0;
+    uint32_t lastSentLocalStatsToMesh = 0;
+    bool statsHaveBeenSent = false;
+    bool localStatsHaveBeenSent = false;
+
+    void refreshUptime()
+    {
+        auto now = millis();
+        // If we wrapped around (~49 days), increment the wrap count
+        if (now < uptimeLastMs)
+            uptimeWrapCount++;
+
+        uptimeLastMs = now;
+    }
+
+    uint32_t uptimeWrapCount;
+    uint32_t uptimeLastMs;
+};
