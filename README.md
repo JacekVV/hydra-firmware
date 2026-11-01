@@ -4,6 +4,17 @@
 <h1>Meshtastic Firmware+ HYDRA optimization esp32+E22P</h1>
 [FW+ fork description](https://github.com/musznik/firmware)
 
+## Hardware
+
+Target board: `hydraE22P` (`variants/esp32/diy/hydra_e22p`)
+
+- MCU: ESP32-D0WD-V3 rev 3.1 (ESP32-WROOM-32D DevKit, `esp32doit-devkit-v1`)
+- Flash: 4 MB
+- SRAM: 320 KB (327 680 B)
+- PSRAM: none (`MAX_NUM_NODES=80` keeps RAM headroom)
+- LoRa: Ebyte E22P-868M30S (EU_868, 30 dBm PA, `-D USE_EBYTE_E22P`)
+- Build usage (current build): RAM 30.4 %, flash 92.5 % of the 2 424 832 B app partition
+
 ## Stats
 
 Snapshot from 2026-11-01:
