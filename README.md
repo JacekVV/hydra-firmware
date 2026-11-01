@@ -1,7 +1,7 @@
 <div markdown="1">
 
 <img src=".github/meshtastic_logo.png" alt="Meshtastic Logo" width="80"/>
-<h1>Meshtastic Firmware+</h1>
+<h1>Meshtastic Firmware+ HYDRA optimization esp32+E22P</h1>
 # Alternative Meshtastic Firmware+
 
 ![GitHub release downloads](https://img.shields.io/github/downloads/meshtastic/firmware/total)
