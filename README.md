@@ -10,42 +10,7 @@
 [![Fiscal Contributors](https://opencollective.com/meshtastic/tiers/badge.svg?label=Fiscal%20Contributors&color=deeppink)](https://opencollective.com/meshtastic/)
 [![Vercel](https://img.shields.io/static/v1?label=Powered%20by&message=Vercel&style=flat&logo=vercel&color=000000)](https://vercel.com?utm_source=meshtastic&utm_campaign=oss)
 
-## Fork features
-
-- Protect private messages on public MQTT: This commit introduces a feature that enhances security by preventing the sending of private messages between nodes when the MQTT uplink is enabled. The motivation behind this change is to ensure that sensitive information is not inadvertently transmitted over potentially insecure channels. Public messages (broadcast) along with telemetry data, remain unrestricted to maintain the core functionality of the network. This feature is configurable via the APK+ for android, providing users with flexibility and control over their network's security. Default: True. (FW < 2.5v~)
-- Default hop limit changed from 3 to 5.
-- Allow to administrate node with "Managed Mode" via Wifi or BT.
-- Less air limits. (configurable)
-- Support for private text message "nodes" (only online) or "nodes all" and return list of nodes.
-- Allow to change node position over mesh.
-- Local stats over mesh (additional telemetry).
-- Sniffer mode, transfers to the connected device (TCP or BT) packets that are not public and do not belong to us without decrypting them. This allows for a better understanding of network operation. Default OFF. Use APK+ to enable it.
-- Router mode always passes everything, not just CORE_PORTS (NodeInfo, Text, Position, Telemetry, Routing) by default.
-- Neighbor Info enabled again on primary channel (LongFast, MediumFast, etc.), enabled by default.
-- Node status custom text transmitted over mesh (as new protobuf, port: 278), requires custom APK like "Meshtastic Android APK+ (loranet version)" for operations.
-- Handling of OnDemand packages, the ability to retrieve packet reception statistics from a node in 10-minute intervals for 40 measurements (6 hours). The ability to request a list of nodes seen by the node (2 hours). Supported in APK+. Port 354.
-- Transmitting the average number of received packets along with 6 measurements (1 hour) for every 10 minutes over the mesh.
-- AutoResponder with user defined text
-- AutoRedirector for message redirection to another node
-- OnDemand requests (new protobuf)
-   - total number of reads and writes (RX/RX) for a 10-minute window across 40 measurements (6h~)
-   - average time spent reading (RX) a packet by LoRA
-   - usage counter of a given protobuf (port) since the node was started
-   - remote node list request
-   - last 10 routing logs (from,to,type)
-   - air activity for tx/rx/idle/rxnoise (10min window) in 10 measurments
-   - routing table for NextHop
-   - simple ping request (ack & non-ack)
-   -request node stats (local stats, telemetry, additional stats)
-- Signal Reply Module (write "ping" to node). https://github.com/VilemR/meshtstic_modules_mod
-- DV-ETX routing metric for path selection: uses Expected Transmission Count to score links and prefer higher-quality routes across the mesh. Configurable and interoperable with existing routing logic.
-- Opportunistic rebroadcast: probabilistic, condition-aware rebroadcasting to improve reach in sparse or lossy topologies while minimizing duplicate traffic and airtime usage.
-- Telemetry limiter: adaptive throttling and aggregation of telemetry ports to respect airtime budgets; configurable limits via APK+ while preserving essential health data.
-- Position limiter: rate limits and jitters GPS position broadcasts; supports movement thresholds (distance/speed) to avoid unnecessary updates when stationary.
-- Passive next-hop learning: NextHopRouter observes traffic to learn and update next-hop mappings without active probes, improving convergence and reducing overhead.
-- Active Store & Forward: buffers messages for temporarily unreachable nodes and forwards them when peers reappear; includes TTL and de-dup safeguards.
-- Memory optimizations
-
+[FW+ fork description](https://github.com/musznik/firmware)
 
 ## Overview
 
@@ -66,5 +31,5 @@ Join our community and help improve Meshtastic! 🚀
 
 ## Credits
 
-- Fork features and this README's fork description: [musznik](https://github.com/musznik/firmware) (FW+ / Meshtastic+, [loranet.pl](https://loranet.pl)).
+- Fork description: [musznik](https://github.com/musznik/firmware) (FW+ / Meshtastic+, [loranet.pl](https://loranet.pl)).
 - Upstream firmware: the [Meshtastic](https://meshtastic.org) project and its contributors.
