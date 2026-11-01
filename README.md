@@ -40,7 +40,7 @@ Snapshot from 2026-11-01:
 - **v24**: fix of the "Hydra telemetry" line, OTA to HM1
 - **v25**: device telemetry counter reset on every start
 - **v26**: no entry in the journal
-- **v27**: Wi-Fi "Hydra telemetry", OTA to HM2–HM5
+- **v27**: Wi-Fi "Hydra telemetry", 
 
 ## Credits
 
