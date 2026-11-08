@@ -26,6 +26,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -U platformio adafruit-nrfutil
           pip install -U meshtastic --pre
+          pip install -U dotmap
 
       - name: Upgrade platformio
         shell: bash
@@ -41,7 +42,7 @@ jobs:
 
       - name: Integration test
         run: |
-          .pio/build/native/program & sleep 10 # 5 seconds was not enough
+          .pio/build/native/meshtasticd & sleep 10 # 5 seconds was not enough
           echo "Simulator started, launching python test..."
           python3 -c 'from meshtastic.test import testSimulator; testSimulator()'
 
