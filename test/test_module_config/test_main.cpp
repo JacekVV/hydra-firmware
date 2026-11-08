@@ -13,6 +13,7 @@
 #include "TestUtil.h"
 #include <unity.h>
 
+#include "mesh/MeshRadio.h" // myRegion / getRegion: the node-mod-admin get reads the region's duty cycle
 #include "mesh/NodeDB.h"
 #include "mesh/mesh-pb-constants.h"
 #include "modules/AdminModule.h"
@@ -27,9 +28,32 @@ static constexpr NodeNum ADMIN_NODE = 0x0B0B0B0B;
 static MockMeshService *mockService = nullptr;
 static AdminModuleTestShim *admin = nullptr;
 
-// Both generated sets are contiguous: ModuleConfigType runs 0.._MAX and the matching ModuleConfig
-// submessage tags run 1.._MAX+1, so type + 1 == tag and no lookup table is needed.
-static const uint32_t moduleConfigTypeCount = _meshtastic_AdminMessage_ModuleConfigType_MAX + 1;
+// The ModuleConfig submessage tags are not contiguous: fork-only modules sit at 20, 21 and 24, and
+// tags 18, 19, 22 and 23 are unused. The sweeps walk exactly the real fields. Admin handlers map a
+// ModuleConfigType to its submessage with explicit cases, so no numeric type-to-tag relation is assumed.
+static const pb_size_t kModuleConfigTags[] = {
+    meshtastic_ModuleConfig_mqtt_tag,
+    meshtastic_ModuleConfig_serial_tag,
+    meshtastic_ModuleConfig_external_notification_tag,
+    meshtastic_ModuleConfig_store_forward_tag,
+    meshtastic_ModuleConfig_range_test_tag,
+    meshtastic_ModuleConfig_telemetry_tag,
+    meshtastic_ModuleConfig_canned_message_tag,
+    meshtastic_ModuleConfig_audio_tag,
+    meshtastic_ModuleConfig_remote_hardware_tag,
+    meshtastic_ModuleConfig_neighbor_info_tag,
+    meshtastic_ModuleConfig_ambient_lighting_tag,
+    meshtastic_ModuleConfig_detection_sensor_tag,
+    meshtastic_ModuleConfig_paxcounter_tag,
+    meshtastic_ModuleConfig_statusmessage_tag,
+    meshtastic_ModuleConfig_traffic_management_tag,
+    meshtastic_ModuleConfig_tak_tag,
+    meshtastic_ModuleConfig_mesh_beacon_tag,
+    meshtastic_ModuleConfig_node_mod_tag,
+    meshtastic_ModuleConfig_node_mod_admin_tag,
+    meshtastic_ModuleConfig_broadcast_assist_tag,
+};
+static const size_t kModuleConfigTagCount = sizeof(kModuleConfigTags) / sizeof(kModuleConfigTags[0]);
 
 // The submessages whose handlers are compiled out on some builds. Everything else must be present
 // unconditionally.
@@ -79,12 +103,15 @@ static bool decodeResponseTagFromReply(meshtastic_MeshPacket *reply, pb_size_t &
     return true;
 }
 
-// The proto guarantees the two enumerations stay in step; the sweeps below rely on it to pair a
-// ModuleConfigType with its submessage tag without a lookup table.
-void test_tagRangeMatchesTypeRange(void)
+// The sweep list must name each submessage once, in ascending order, and end at the highest tag.
+void test_tagListIsStrictlyAscendingAndComplete(void)
 {
-    TEST_ASSERT_EQUAL_MESSAGE(moduleConfigTypeCount, meshtastic_ModuleConfig_mesh_beacon_tag,
-                              "ModuleConfigType and ModuleConfig submessage tags are no longer 1:1");
+    for (size_t i = 1; i < kModuleConfigTagCount; i++) {
+        TEST_ASSERT_TRUE_MESSAGE(kModuleConfigTags[i - 1] < kModuleConfigTags[i],
+                                 "ModuleConfig tag list must be strictly ascending (no duplicates)");
+    }
+    TEST_ASSERT_EQUAL_MESSAGE(meshtastic_ModuleConfig_broadcast_assist_tag, kModuleConfigTags[kModuleConfigTagCount - 1],
+                              "ModuleConfig tag list must end at the highest submessage tag");
 }
 
 // The full lifecycle per submessage: admin set -> encode (what saveToDisk writes) -> decode into the
@@ -92,7 +119,8 @@ void test_tagRangeMatchesTypeRange(void)
 // shows up as a 0-byte encode; a missing get case as an empty or mismatched response.
 void test_everyModuleConfig_survivesSetSaveLoadGet(void)
 {
-    for (pb_size_t tag = 1; tag <= moduleConfigTypeCount; tag++) {
+    for (size_t i = 0; i < kModuleConfigTagCount; i++) {
+        const pb_size_t tag = kModuleConfigTags[i];
         if (moduleConfigIsCompiledOut(tag))
             continue;
         moduleConfig = meshtastic_LocalModuleConfig_init_zero;
@@ -139,7 +167,8 @@ void test_everyModuleConfig_survivesSetSaveLoadGet(void)
 void test_sequentialSets_preserveEarlierWrites(void)
 {
     size_t prevLen = 0;
-    for (pb_size_t tag = 1; tag <= moduleConfigTypeCount; tag++) {
+    for (size_t i = 0; i < kModuleConfigTagCount; i++) {
+        const pb_size_t tag = kModuleConfigTags[i];
         if (moduleConfigIsCompiledOut(tag))
             continue;
 
@@ -166,6 +195,9 @@ void setUp(void)
     config = meshtastic_LocalConfig_init_zero;
     myNodeInfo = meshtastic_MyNodeInfo_init_zero;
     myNodeInfo.my_node_num = LOCAL_NODE;
+    // The node-mod-admin get reports the region's duty cycle through myRegion, which the firmware sets
+    // when the radio applies its region at boot. This suite has no radio, so pick a region here.
+    myRegion = getRegion(meshtastic_Config_LoRaConfig_RegionCode_US);
 }
 
 void tearDown(void)
@@ -173,6 +205,7 @@ void tearDown(void)
     admin->drainReply();
     delete admin;
     admin = nullptr;
+    myRegion = nullptr;
 
     service = nullptr;
     delete mockService;
@@ -185,7 +218,7 @@ void setup()
     initializeTestEnvironment();
     UNITY_BEGIN();
 
-    RUN_TEST(test_tagRangeMatchesTypeRange);
+    RUN_TEST(test_tagListIsStrictlyAscendingAndComplete);
     RUN_TEST(test_everyModuleConfig_survivesSetSaveLoadGet);
     RUN_TEST(test_sequentialSets_preserveEarlierWrites);
 

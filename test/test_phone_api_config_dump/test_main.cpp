@@ -66,6 +66,12 @@ const pb_size_t kExpectedModuleConfigVariants[] = {
 #else
     0, // beacon compiled out: the slot still ships, as an empty ModuleConfig
 #endif
+    // Tags 18, 19, 22 and 23 are not ModuleConfig fields: their slots ship empty.
+    0, 0,
+    meshtastic_ModuleConfig_node_mod_tag,
+    meshtastic_ModuleConfig_node_mod_admin_tag,
+    0, 0,
+    meshtastic_ModuleConfig_broadcast_assist_tag,
 };
 static_assert(sizeof(kExpectedModuleConfigVariants) / sizeof(kExpectedModuleConfigVariants[0]) == NUM_MODULE_CONFIG_MESSAGES,
               "AdminMessage ModuleConfigType enum and ModuleConfig oneof diverged - update STATE_SEND_MODULECONFIG and this "

@@ -933,10 +933,23 @@ size_t PhoneAPI::getFromRadio(uint8_t *buf)
             }
             break;
 #endif
-        case meshtastic_AdminMessage_ModuleConfigType_NODEMOD_ADMIN_CONFIG: // fw+: the config dump must carry it, or clients read defaults
+        // fw+ modules. The switch runs over ModuleConfig submessage tags, not ModuleConfigType values:
+        // the enum value 20 is NODEMOD_ADMIN, but the tag 20 is node_mod. Matching on the tags keeps each
+        // config in the dump, or clients read defaults.
+        case meshtastic_ModuleConfig_node_mod_tag:
+            LOG_DEBUG("Send module config: node mod");
+            fromRadioScratch.moduleConfig.which_payload_variant = meshtastic_ModuleConfig_node_mod_tag;
+            fromRadioScratch.moduleConfig.payload_variant.node_mod = moduleConfig.node_mod;
+            break;
+        case meshtastic_ModuleConfig_node_mod_admin_tag:
             LOG_DEBUG("Send module config: node mod admin");
             fromRadioScratch.moduleConfig.which_payload_variant = meshtastic_ModuleConfig_node_mod_admin_tag;
             fromRadioScratch.moduleConfig.payload_variant.node_mod_admin = moduleConfig.node_mod_admin;
+            break;
+        case meshtastic_ModuleConfig_broadcast_assist_tag:
+            LOG_DEBUG("Send module config: broadcast assist");
+            fromRadioScratch.moduleConfig.which_payload_variant = meshtastic_ModuleConfig_broadcast_assist_tag;
+            fromRadioScratch.moduleConfig.payload_variant.broadcast_assist = moduleConfig.broadcast_assist;
             break;
         default:
             LOG_DEBUG("Unhandled module config type %d", config_state);

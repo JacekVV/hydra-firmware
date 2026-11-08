@@ -15,6 +15,7 @@
 
 #include "mesh/Channels.h"
 #include "mesh/NodeDB.h"
+#include "mesh/Router.h" // router global: allocErrorResponse() allocates the reply through it
 #include "mesh/mesh-pb-constants.h"
 #include "modules/AdminModule.h"
 #include "support/AdminModuleTestShim.h"
@@ -144,8 +145,25 @@ static meshtastic_MeshPacket makeOutgoingModuleConfigRequest(
     return makeOutgoingRequest(to, req);
 }
 
+// Rejected setters answer through allocErrorResponse(), which dereferences the router global. The
+// firmware installs a router at boot; this test has none, so install a send-only mock for its run.
+class SessionReproRouter : public Router
+{
+  public:
+    ErrorCode send(meshtastic_MeshPacket *p) override
+    {
+        packetPool.release(p);
+        return ERRNO_OK;
+    }
+};
+static Router *savedRouter = nullptr;
+static Router *sessionReproRouter = nullptr;
+
 void setUp(void)
 {
+    savedRouter = router;
+    sessionReproRouter = new SessionReproRouter();
+    router = sessionReproRouter;
     mockService = new MockMeshService();
     service = mockService;
     admin = new AdminModuleTestShim();
@@ -179,6 +197,9 @@ void tearDown(void)
     mockService = nullptr;
     delete admin;
     admin = nullptr;
+    router = savedRouter;
+    delete sessionReproRouter;
+    sessionReproRouter = nullptr;
 }
 
 // ndoo's report: a setter from a remote node with NO valid session is rejected, and the node's
