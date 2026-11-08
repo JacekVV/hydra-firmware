@@ -7,12 +7,15 @@
 
 #include "PointerQueue.h"
 #include "configuration.h" // For LOG_WARN, LOG_DEBUG, LOG_HEAP
+#include "memory/MemAudit.h"
 
 template <class T> class Allocator
 {
 
   public:
-    Allocator() : deleter([this](T *p) { this->release(p); }) {}
+    /// Optional memaudit tag: when set, live objects from this allocator are
+    /// reported under it (+/- sizeof(T) per alloc/release).
+    explicit Allocator(const char *auditTag = nullptr) : deleter([this](T *p) { this->release(p); }), auditTag(auditTag) {}
     virtual ~Allocator() {}
 
     /// Return a queable object which has been prefilled with zeros.  Return nullptr if no buffer is available
@@ -69,18 +72,21 @@ template <class T> class Allocator
     /// Return a buffer for use by others
     virtual void release(T *p) = 0;
 
-    /// hydra: objects currently allocated and the peak since the last resetPeak(), -1 if not tracked
-    virtual int inUse() const { return -1; }
-    virtual int peakInUse() const { return -1; }
-    virtual void resetPeak() {}
-
   protected:
     // Alloc some storage
     virtual T *alloc(TickType_t maxWait) = 0;
 
+    // Report a live-object delta to memaudit (no-op when untagged)
+    void auditAdd(int32_t delta)
+    {
+        if (auditTag)
+            memaudit::add(auditTag, delta);
+    }
+
   private:
     // std::unique_ptr Deleter function; calls release().
     const std::function<void(T *)> deleter;
+    const char *auditTag; // memaudit tag, or nullptr for untracked pools
 };
 
 /**
@@ -89,6 +95,8 @@ template <class T> class Allocator
 template <class T> class MemoryDynamic : public Allocator<T>
 {
   public:
+    explicit MemoryDynamic(const char *auditTag = nullptr) : Allocator<T>(auditTag) {}
+
     /// Return a buffer for use by others
     virtual void release(T *p) override
     {
@@ -97,30 +105,22 @@ template <class T> class MemoryDynamic : public Allocator<T>
 
         LOG_HEAP("Freeing 0x%x", p);
 
+        this->auditAdd(-(int32_t)sizeof(T));
         free(p);
-        used--;
     }
-
-    int inUse() const override { return used; }
-    int peakInUse() const override { return peak; }
-    void resetPeak() override { peak = used; }
 
   protected:
     // Alloc some storage
     virtual T *alloc(TickType_t maxWait) override
     {
         T *p = (T *)malloc(sizeof(T));
-        if (!p) { // hydra: out of heap, let the caller drop the packet instead of asserting (restart)
-            LOG_ERROR("Out of heap for a %u byte packet", (unsigned)sizeof(T));
+        if (!p) {
+            LOG_WARN("malloc(%u) failed, heap exhausted", (unsigned)sizeof(T));
             return nullptr;
         }
-        if (++used > peak)
-            peak = used;
+        this->auditAdd((int32_t)sizeof(T));
         return p;
     }
-
-  private:
-    volatile int used = 0, peak = 0; // hydra
 };
 
 /**
@@ -133,7 +133,7 @@ template <class T, int MaxSize> class MemoryPool : public Allocator<T>
     bool used[MaxSize];
 
   public:
-    MemoryPool() : pool{}, used{}
+    explicit MemoryPool(const char *auditTag = nullptr) : Allocator<T>(auditTag), pool{}, used{}
     {
         // Arrays are now zero-initialized by member initializer list
         // pool array: all elements are default-constructed (zero for POD types)
@@ -153,9 +153,10 @@ template <class T, int MaxSize> class MemoryPool : public Allocator<T>
         if (index >= 0 && index < MaxSize) {
             assert(used[index]); // Should be marked as used
             used[index] = false;
+            this->auditAdd(-(int32_t)sizeof(T));
             LOG_HEAP("Released static pool item %d at 0x%x", index, p);
         } else {
-            LOG_WARN("Pointer 0x%x not from our pool!", p);
+            LOG_WARN("Pointer 0x%x not from our pool", p);
         }
     }
 
@@ -167,13 +168,14 @@ template <class T, int MaxSize> class MemoryPool : public Allocator<T>
         for (int i = 0; i < MaxSize; i++) {
             if (!used[i]) {
                 used[i] = true;
+                this->auditAdd((int32_t)sizeof(T));
                 LOG_HEAP("Allocated static pool item %d at 0x%x", i, &pool[i]);
                 return &pool[i];
             }
         }
 
         // No free slots available - return nullptr instead of asserting
-        LOG_WARN("No free slots available in static memory pool!");
+        LOG_WARN("No free slots available in static memory pool");
         return nullptr;
     }
 };

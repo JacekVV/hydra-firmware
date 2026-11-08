@@ -8,17 +8,23 @@
 #include "graphics/Screen.h"
 #include "memGet.h"
 #include "mesh/generated/meshtastic/config.pb.h"
-#include "mesh/generated/meshtastic/mesh.pb.h"
 #include "mesh/generated/meshtastic/telemetry.pb.h"
 #include <SPI.h>
 #include <map>
-#if defined(ARCH_ESP32) && !defined(CONFIG_IDF_TARGET_ESP32S2)
+#include <memory>
+#if defined(ARCH_ESP32) && !defined(CONFIG_IDF_TARGET_ESP32S2) && !MESHTASTIC_EXCLUDE_BLUETOOTH
 #include "nimble/NimbleBluetooth.h"
 extern NimbleBluetooth *nimbleBluetooth;
 #endif
 #ifdef ARCH_NRF52
 #include "NRF52Bluetooth.h"
 extern NRF52Bluetooth *nrf52Bluetooth;
+#endif
+#ifdef ARCH_PORTDUINO
+#include "platform/portduino/LinuxBluetooth.h" // self-guards; defines MESHTASTIC_LINUX_BLE when BLE is compiled in
+#ifdef MESHTASTIC_LINUX_BLE
+extern LinuxBluetooth *linuxBluetooth;
+#endif
 #endif
 #if !MESHTASTIC_EXCLUDE_I2C
 #include "detect/ScanI2CTwoWire.h"
@@ -36,6 +42,7 @@ extern bool kb_found;
 extern bool osk_found;
 extern ScanI2C::DeviceAddress rtc_found;
 extern ScanI2C::DeviceAddress accelerometer_found;
+extern ScanI2C::DeviceAddress magnetometer_found;
 extern ScanI2C::FoundDevice rgb_found;
 extern ScanI2C::DeviceAddress aqi_found;
 
@@ -64,11 +71,15 @@ extern UdpMulticastHandler *udpHandler;
 #endif
 
 // Global Screen singleton.
-extern graphics::Screen *screen;
+extern std::unique_ptr<graphics::Screen> screen;
 
 #if !defined(ARCH_STM32WL) && !MESHTASTIC_EXCLUDE_I2C && !MESHTASTIC_EXCLUDE_ACCELEROMETER
 #include "motion/AccelerometerThread.h"
 extern AccelerometerThread *accelerometerThread;
+#endif
+#if !defined(ARCH_STM32WL) && !MESHTASTIC_EXCLUDE_I2C && !MESHTASTIC_EXCLUDE_MAGNETOMETER
+#include "motion/MagnetometerThread.h"
+extern MagnetometerThread *magnetometerThread;
 #endif
 
 extern bool isVibrating;
@@ -83,17 +94,24 @@ extern uint32_t timeLastPowered;
 extern uint32_t rebootAtMsec;
 extern uint32_t shutdownAtMsec;
 extern bool suppressRebootBanner;
+#ifdef ARCH_STM32
+extern uint32_t enterDfuAtMsec; // 0 = unset; else millis() deadline for the deferred DFU jump
+#endif
+
+#if defined(MESHTASTIC_ENCRYPTED_STORAGE) && defined(MESHTASTIC_PHONEAPI_ACCESS_CONTROL)
+// Set by PhoneAPI::handleLockdownAuthInline after a successful unlock.
+// Serviced on the main loop thread because NodeDB::reloadFromDisk() is
+// too heavy for the BLE/serial transport callback stack.
+extern volatile bool lockdownReloadPending;
+
+// Set by PhoneAPI::handleLockdownAuthInline on a disable request (after the
+// passphrase is verified). Serviced on the main loop thread: decrypt every
+// pref back to plaintext, remove the lockdown artifacts, reboot. Heavy file
+// IO, same reason as lockdownReloadPending.
+extern volatile bool lockdownDisablePending;
+#endif
 
 extern uint32_t serialSinceMsec;
-
-static volatile int g_busyCounter = 0;
-static volatile uint64_t g_totalBusyTimeUs = 0;
-// micros() is 32-bit on ESP32/Arduino; store start in the same domain so elapsed deltas wrap safely.
-static volatile uint32_t g_lastBusyStartUs = 0;
-static volatile bool     g_isBusy            = false;
-extern uint32_t CpuHwUsagePercent;
-extern void startBusy();
-extern void endBusy();
 
 // If a thread does something that might need for it to be rescheduled ASAP it can set this flag
 // This will suppress the current delay and instead try to run ASAP.
@@ -101,10 +119,10 @@ extern bool runASAP;
 
 extern bool pauseBluetoothLogging;
 
-void nrf52Setup(), esp32Setup(), nrf52Loop(), esp32Loop(), rp2040Setup(), clearBonds(), enterDfuMode();
+void nrf52Setup(), esp32Setup(), nrf52Loop(), esp32Loop(), rp2040Setup(), rp2040Loop(), clearBonds(), enterDfuMode(),
+    nrf52FlashQuiesce(), stm32wlSetup();
 #ifdef ARCH_ESP32
-void releaseBluetoothMemoryIfWifi(); // hydra
-void hydraFillMyNodeInfo(meshtastic_MyNodeInfo &info); // hydra
+void esp32ReleaseBluetoothMemoryIfUnused();
 #endif
 
 meshtastic_DeviceMetadata getDeviceMetadata();
@@ -115,3 +133,14 @@ void scannerToSensorsMap(const std::unique_ptr<ScanI2CTwoWire> &i2cScanner, Scan
 
 // We default to 4MHz SPI, SPI mode 0
 extern SPISettings spiSettings;
+
+// fw+: CPU usage percent for OnDemand node stats (updated by the CPU busy sampler, see main.cpp)
+extern uint32_t CpuHwUsagePercent;
+void startBusy();
+void endBusy();
+
+// Marks the enclosing scope as CPU-busy for the sampler behind CpuHwUsagePercent.
+struct BusyScope {
+    BusyScope() { startBusy(); }
+    ~BusyScope() { endBusy(); }
+};

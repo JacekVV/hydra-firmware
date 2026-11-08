@@ -8,7 +8,6 @@
  * If you are using protobufs to encode your packets (recommended) you can use this as a baseclass for your module
  * and avoid a bunch of boilerplate code.
  */
-
 template <class T> class ProtobufModule : protected SinglePortModule
 {
     const pb_msgdesc_t *fields;
@@ -21,14 +20,9 @@ template <class T> class ProtobufModule : protected SinglePortModule
     ProtobufModule(const char *_name, meshtastic_PortNum _ourPortNum, const pb_msgdesc_t *_fields)
         : SinglePortModule(_name, _ourPortNum), fields(_fields)
     {
-        //memset(portCounters, 0, MAX_PORTS * sizeof(uint32_t));
-        //portCounters[MAX_PORTS] = {0};
     }
 
   protected:
-
-    //fw+
-
     /**
      * Handle a received message, the data field in the message is already decoded and is provided
      *
@@ -39,7 +33,7 @@ template <class T> class ProtobufModule : protected SinglePortModule
 
     /** Called to make changes to a particular incoming message
      */
-    virtual void alterReceivedProtobuf(meshtastic_MeshPacket &mp, T *decoded){};
+    virtual void alterReceivedProtobuf(meshtastic_MeshPacket &mp, T *decoded) {};
 
     /**
      * Return a mesh packet which has been preinited with a particular protobuf data payload and port number.
@@ -50,6 +44,8 @@ template <class T> class ProtobufModule : protected SinglePortModule
     {
         // Update our local node info with our position (even if we don't decide to update anyone else)
         meshtastic_MeshPacket *p = allocDataPacket();
+        if (!p)
+            return nullptr;
 
         p->decoded.payload.size =
             pb_encode_to_bytes(p->decoded.payload.bytes, sizeof(p->decoded.payload.bytes), fields, &payload);
@@ -64,7 +60,7 @@ template <class T> class ProtobufModule : protected SinglePortModule
     const char *getSenderShortName(const meshtastic_MeshPacket &mp)
     {
         auto node = nodeDB->getMeshNode(getFrom(&mp));
-        const char *sender = (node) ? node->user.short_name : "???";
+        const char *sender = (node && nodeInfoLiteHasUser(node) && node->short_name[0]) ? node->short_name : "???";
         return sender;
     }
 
@@ -84,14 +80,6 @@ template <class T> class ProtobufModule : protected SinglePortModule
     */
     virtual ProcessMessage handleReceived(const meshtastic_MeshPacket &mp) override
     {
-        //fw+
-        // if (mp.which_payload_variant == meshtastic_MeshPacket_decoded_tag) {
-        //             int port = mp.decoded.portnum;
-        //             if (port >= 0 && port < MAX_PORTS) {
-        //                 ++portCounters[port];
-        //             }
-        // }
-
         // FIXME - we currently update position data in the DB only if the message was a broadcast or destined to us
         // it would be better to update even if the message was destined to others.
 
@@ -103,15 +91,15 @@ template <class T> class ProtobufModule : protected SinglePortModule
             memset(&scratch, 0, sizeof(scratch));
             if (pb_decode_from_bytes(p.payload.bytes, p.payload.size, fields, &scratch)) {
                 decoded = &scratch;
-                LOG_INFO("Received %s from=0x%0x, id=0x%x, portnum=%d, payloadlen=%d", name, mp.from, mp.id, p.portnum,
+                LOG_INFO("Received %s from=0x%08x, id=0x%08x, portnum=%d, payloadlen=%d", name, mp.from, mp.id, p.portnum,
                          p.payload.size);
             } else {
-                LOG_ERROR("Error decoding proto module!");
+                LOG_ERROR("Error decoding proto module");
                 // if we can't decode it, nobody can process it!
                 return ProcessMessage::STOP;
             }
         }
-          
+
         return handleReceivedProtobuf(mp, decoded) ? ProcessMessage::STOP : ProcessMessage::CONTINUE;
     }
 
@@ -127,7 +115,7 @@ template <class T> class ProtobufModule : protected SinglePortModule
             if (pb_decode_from_bytes(p.payload.bytes, p.payload.size, fields, &scratch)) {
                 decoded = &scratch;
             } else {
-                LOG_ERROR("Error decoding proto module!");
+                LOG_ERROR("Error decoding proto module");
                 // if we can't decode it, nobody can process it!
                 return;
             }
@@ -136,4 +124,3 @@ template <class T> class ProtobufModule : protected SinglePortModule
         }
     }
 };
-

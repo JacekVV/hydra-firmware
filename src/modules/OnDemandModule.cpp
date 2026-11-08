@@ -15,9 +15,6 @@
 #include "SPILock.h"
 #include "FSCommon.h"
 #include "StoreForwardModule.h"
-#if !MESHTASTIC_EXCLUDE_DTN && __has_include("DtnOverlayModule.h")
-#include "DtnOverlayModule.h"
-#endif
 #include "BroadcastAssistModule.h"
 #include "FwPlusVersion.h"
 
@@ -112,10 +109,6 @@ bool OnDemandModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, mes
                 sendPacketToRequester(prepareBroadcastAssistStats(), mp);
                 break;
             }
-            case meshtastic_OnDemandType_REQUEST_DTN_OVERLAY_STATS: {
-                sendPacketToRequester(prepareDtnOverlayStats(), mp);
-                break;
-            }
             default:
                 meshtastic_OnDemand unknown_ondemand = meshtastic_OnDemand_init_zero;
                 unknown_ondemand.which_variant = meshtastic_OnDemand_response_tag;
@@ -184,7 +177,7 @@ std::vector<std::unique_ptr<meshtastic_OnDemand>> OnDemandModule::createSegmente
             meshtastic_NodeInfoLite *node = nodeDB->getMeshNodeByIndex(currentIndex);
             // filter: direct only if requested (hop==0 and not via mqtt)
             if (directOnly) {
-                if (!(node->hops_away == 0 && !node->via_mqtt)) {
+                if (!(node->hops_away == 0 && !nodeInfoLiteViaMqtt(node))) {
                     currentIndex++;
                     continue;
                 }
@@ -210,16 +203,19 @@ std::vector<std::unique_ptr<meshtastic_OnDemand>> OnDemandModule::createSegmente
             if(node->hops_away==0){
                 entry.snr = node->snr;
             }
+            // hydra: RSSI only for direct neighbours (NodeDB keeps last_rssi at 0 for relayed nodes); 0 = unknown
+            entry.rx_rssi = (node->has_hops_away && node->hops_away == 0) ? node->last_rssi : 0;
             
-            strncpy(entry.long_name, node->user.long_name, sizeof(entry.long_name) - 1);
-            strncpy(entry.short_name, node->user.short_name, sizeof(entry.short_name) - 1);
+            strncpy(entry.long_name, node->long_name, sizeof(entry.long_name) - 1);
+            strncpy(entry.short_name, node->short_name, sizeof(entry.short_name) - 1);
 
             // Populate optional integer latitude/longitude if available
-            if (nodeDB->hasValidPosition(node)) {
+            meshtastic_PositionLite nodePos = meshtastic_PositionLite_init_zero;
+            if (nodeDB->hasValidPosition(node) && nodeDB->copyNodePosition(node->num, nodePos)) {
                 entry.has_latitude_i = true;
-                entry.latitude_i = node->position.latitude_i;
+                entry.latitude_i = nodePos.latitude_i;
                 entry.has_longitude_i = true;
-                entry.longitude_i = node->position.longitude_i;
+                entry.longitude_i = nodePos.longitude_i;
             }
 
             // capacity guard for nanopb repeated field
@@ -340,7 +336,7 @@ meshtastic_OnDemand OnDemandModule::prepareRxAvgTimeHistory()
     size_t count = 40;
     if (count > cap) count = cap;
     hist.rx_avg_history_count = (pb_size_t)count;
-    memcpy(hist.rx_avg_history, airTime->rxWindowAverages, count * sizeof(hist.rx_avg_history[0]));
+    airTime->rxWindowAverageHistory(hist.rx_avg_history, count);
 
     return onDemand;
 }
@@ -352,112 +348,6 @@ meshtastic_OnDemand OnDemandModule::prepareFwPlusVersion()
     onDemand.variant.response.response_type = meshtastic_OnDemandType_RESPONSE_FW_PLUS_VERSION;
     onDemand.variant.response.which_response_data = meshtastic_OnDemandResponse_fw_plus_version_tag;
     onDemand.variant.response.response_data.fw_plus_version.version_number = FW_PLUS_VERSION;
-    return onDemand;
-}
-
-meshtastic_OnDemand OnDemandModule::prepareDtnOverlayStats()
-{
-    meshtastic_OnDemand onDemand = meshtastic_OnDemand_init_zero;
-    onDemand.which_variant = meshtastic_OnDemand_response_tag;
-    onDemand.variant.response.response_type = meshtastic_OnDemandType_RESPONSE_DTN_OVERLAY_STATS;
-    onDemand.variant.response.which_response_data = meshtastic_OnDemandResponse_dtn_overlay_stats_tag;
-
-    auto &dst = onDemand.variant.response.response_data.dtn_overlay_stats;
-    dst.has_enabled = true;
-    
-#if !MESHTASTIC_EXCLUDE_DTN && __has_include("DtnOverlayModule.h")
-    dst.enabled = (moduleConfig.has_dtn_overlay && moduleConfig.dtn_overlay.enabled);
-    if (dtnOverlayModule) {
-        DtnOverlayModule::DtnStatsSnapshot s{};
-        dtnOverlayModule->getStatsSnapshot(s);
-        // Basic stats
-        if (s.pendingCount > 0) { dst.has_pending_count = true; dst.pending_count = (uint32_t)s.pendingCount; }
-        if (s.forwardsAttempted > 0) { dst.has_forwards_attempted = true; dst.forwards_attempted = s.forwardsAttempted; }
-        if (s.fallbacksAttempted > 0) { dst.has_fallbacks_attempted = true; dst.fallbacks_attempted = s.fallbacksAttempted; }
-        if (s.receiptsEmitted > 0) { dst.has_receipts_emitted = true; dst.receipts_emitted = s.receiptsEmitted; }
-        if (s.receiptsReceived > 0) { dst.has_receipts_received = true; dst.receipts_received = s.receiptsReceived; }
-        if (s.expired > 0) { dst.has_expired = true; dst.expired = s.expired; }
-        if (s.giveUps > 0) { dst.has_give_ups = true; dst.give_ups = s.giveUps; }
-        if (s.milestonesSent > 0) { dst.has_milestones_sent = true; dst.milestones_sent = s.milestonesSent; }
-        if (s.probesSent > 0) { dst.has_probes_sent = true; dst.probes_sent = s.probesSent; }
-        if (s.lastForwardAgeSecs > 0) { dst.has_last_forward_age_secs = true; dst.last_forward_age_secs = s.lastForwardAgeSecs; }
-        if (s.knownNodesCount > 0) { dst.has_known_nodes_count = true; dst.known_nodes_count = s.knownNodesCount; }
-        // Custody & handoff stats
-        if (s.handoffsAttempted > 0) { dst.has_handoffs_attempted = true; dst.handoffs_attempted = s.handoffsAttempted; }
-        if (s.handoffCacheHits > 0) { dst.has_handoff_cache_hits = true; dst.handoff_cache_hits = s.handoffCacheHits; }
-        if (s.loopsDetected > 0) { dst.has_loops_detected = true; dst.loops_detected = s.loopsDetected; }
-        // Local delivery stats
-        if (s.deliveredLocal > 0) { dst.has_delivered_local = true; dst.delivered_local = s.deliveredLocal; }
-        if (s.duplicatesSuppressed > 0) { dst.has_duplicates_suppressed = true; dst.duplicates_suppressed = s.duplicatesSuppressed; }
-        // Progressive relay stats
-        if (s.progressiveRelays > 0) { dst.has_progressive_relays = true; dst.progressive_relays = s.progressiveRelays; }
-        if (s.progressiveRelayLoops > 0) { dst.has_progressive_relay_loops = true; dst.progressive_relay_loops = s.progressiveRelayLoops; }
-        // Adaptive routing stats
-        if (s.adaptiveReroutes > 0) { dst.has_adaptive_reroutes = true; dst.adaptive_reroutes = s.adaptiveReroutes; }
-        if (s.linkHealthChecks > 0) { dst.has_link_health_checks = true; dst.link_health_checks = s.linkHealthChecks; }
-        if (s.pathLearningUpdates > 0) { dst.has_path_learning_updates = true; dst.path_learning_updates = s.pathLearningUpdates; }
-        if (s.monitoredLinks > 0) { dst.has_monitored_links = true; dst.monitored_links = s.monitoredLinks; }
-        if (s.monitoredPaths > 0) { dst.has_monitored_paths = true; dst.monitored_paths = s.monitoredPaths; }
-        // Fallback stats
-        if (s.fwplusUnresponsiveFallbacks > 0) { dst.has_fwplus_unresponsive_fallbacks = true; dst.fwplus_unresponsive_fallbacks = s.fwplusUnresponsiveFallbacks; }
-    }
-#else
-    // DTN compiled out
-    dst.enabled = false;
-#endif
-
-    //guard against radio MTU: trim least critical fields by priority
-    // Priority 1: Drop detailed routing stats (lowest priority)
-    if (!fitsInPacket(onDemand, MAX_PACKET_SIZE)) {
-        dst.has_monitored_links = false;
-        dst.has_monitored_paths = false;
-        dst.has_handoff_cache_hits = false;
-    }
-    // Priority 2: Drop advanced stats
-    if (!fitsInPacket(onDemand, MAX_PACKET_SIZE)) {
-        dst.has_link_health_checks = false;
-        dst.has_path_learning_updates = false;
-        dst.has_progressive_relay_loops = false;
-        dst.has_duplicates_suppressed = false;
-    }
-    // Priority 3: Drop telemetry stats
-    if (!fitsInPacket(onDemand, MAX_PACKET_SIZE)) {
-        dst.has_known_nodes_count = false;
-        dst.has_milestones_sent = false;
-        dst.has_probes_sent = false;
-    }
-    // Priority 4: Drop timing stats
-    if (!fitsInPacket(onDemand, MAX_PACKET_SIZE)) {
-        dst.has_last_forward_age_secs = false;
-    }
-    // Priority 5: Drop advanced delivery stats
-    if (!fitsInPacket(onDemand, MAX_PACKET_SIZE)) {
-        dst.has_adaptive_reroutes = false;
-        dst.has_progressive_relays = false;
-        dst.has_loops_detected = false;
-        dst.has_delivered_local = false;
-    }
-    // Priority 6: Drop receipt stats
-    if (!fitsInPacket(onDemand, MAX_PACKET_SIZE)) {
-        dst.has_receipts_received = false;
-        dst.has_receipts_emitted = false;
-    }
-    // Priority 7: Drop custody stats
-    if (!fitsInPacket(onDemand, MAX_PACKET_SIZE)) {
-        dst.has_handoffs_attempted = false;
-        dst.has_fwplus_unresponsive_fallbacks = false;
-    }
-    // Priority 8: Drop forwarding stats
-    if (!fitsInPacket(onDemand, MAX_PACKET_SIZE)) {
-        dst.has_fallbacks_attempted = false;
-        dst.has_forwards_attempted = false;
-    }
-    // Priority 9: Keep only critical error stats (highest priority)
-    if (!fitsInPacket(onDemand, MAX_PACKET_SIZE)) {
-        dst.has_give_ups = false;
-        dst.has_expired = false;
-    }
-   
     return onDemand;
 }
 
@@ -515,6 +405,8 @@ meshtastic_OnDemand OnDemandModule::prepareNodeStats()
     onDemand.variant.response.response_data.node_stats.battery_level = (!powerStatus->getHasBattery() || powerStatus->getIsCharging()) ? MAGIC_USB_BATTERY_LEVEL : powerStatus->getBatteryChargePercent();
     onDemand.variant.response.response_data.node_stats.voltage = powerStatus->getBatteryVoltageMv() / 1000.0;
     onDemand.variant.response.response_data.node_stats.channel_utilization = airTime->channelUtilizationPercent();
+    onDemand.variant.response.response_data.node_stats.has_noise_floor = true; // hydra: szum radia (OnDemand, bez local_stats przez mesh)
+    onDemand.variant.response.response_data.node_stats.noise_floor = RadioLibInterface::instance ? RadioLibInterface::instance->getAverageNoiseFloor() : 0;
     onDemand.variant.response.response_data.node_stats.air_util_tx = airTime->utilizationTXPercent();
     onDemand.variant.response.response_data.node_stats.uptime_seconds = getUptimeSeconds();
     onDemand.variant.response.response_data.node_stats.num_packets_tx = RadioLibInterface::instance->txGood;
@@ -539,6 +431,11 @@ meshtastic_OnDemand OnDemandModule::prepareNodeStats()
     onDemand.variant.response.response_data.node_stats.blocked_by_hoplimit = router->blocked_by_hoplimit;
     onDemand.variant.response.response_data.node_stats.fw_plus_version = FW_PLUS_VERSION;
     onDemand.variant.response.response_data.node_stats.rebroadcast_mode = config.device.rebroadcast_mode;
+    // hydra: byte counters already kept by RadioLibInterface (same source as local_stats_extended)
+    onDemand.variant.response.response_data.node_stats.has_rx_total_bytes = true;
+    onDemand.variant.response.response_data.node_stats.rx_total_bytes = RadioLibInterface::instance->rxTotalBytes;
+    onDemand.variant.response.response_data.node_stats.has_tx_total_bytes = true;
+    onDemand.variant.response.response_data.node_stats.tx_total_bytes = RadioLibInterface::instance->txTotalBytes;
     // Ensure null-terminated firmware_version to avoid nanopb string overflow
     strncpy(onDemand.variant.response.response_data.node_stats.firmware_version,
             optstr(APP_VERSION_SHORT),
@@ -557,15 +454,16 @@ meshtastic_OnDemand OnDemandModule::prepareNodeStats()
     m.which_variant = meshtastic_Telemetry_power_metrics_tag;
     m.variant.power_metrics = meshtastic_PowerMetrics_init_zero;
 
-    if (ina219Sensor.hasSensor())
+    // hydra: take metrics from the first sensor that returns valid data; a later failed sensor must not overwrite it.
+    if (!valid && ina219Sensor.hasSensor())
         valid = ina219Sensor.getMetrics(&m);
-    if (ina226Sensor.hasSensor())
+    if (!valid && ina226Sensor.hasSensor())
         valid = ina226Sensor.getMetrics(&m);
-    if (ina260Sensor.hasSensor())
+    if (!valid && ina260Sensor.hasSensor())
         valid = ina260Sensor.getMetrics(&m);
-    if (ina3221Sensor.hasSensor())
+    if (!valid && ina3221Sensor.hasSensor())
         valid = ina3221Sensor.getMetrics(&m);
-    if (max17048Sensor.hasSensor())
+    if (!valid && max17048Sensor.hasSensor())
         valid = max17048Sensor.getMetrics(&m);
 
     if(valid){
@@ -642,11 +540,13 @@ meshtastic_OnDemand OnDemandModule::prepareAirActivityHistoryLog()
     onDemand.variant.response.response_type = meshtastic_OnDemandType_RESPONSE_AIR_ACTIVITY_HISTORY;
     onDemand.variant.response.which_response_data = meshtastic_OnDemandResponse_air_activity_history_tag;
 
+    ActivityTime history[10];
+    airTime->activityWindowHistory(history, 10);
     onDemand.variant.response.response_data.air_activity_history.air_activity_history_count=10;
     for (uint16_t i = 0; i < 10; i++) {
-            onDemand.variant.response.response_data.air_activity_history.air_activity_history[i].rx_time = airTime->activityWindow[i].rx_time;
-            onDemand.variant.response.response_data.air_activity_history.air_activity_history[i].tx_time = airTime->activityWindow[i].tx_time;
-            onDemand.variant.response.response_data.air_activity_history.air_activity_history[i].rxBad_time = airTime->activityWindow[i].rx_bad_time;
+            onDemand.variant.response.response_data.air_activity_history.air_activity_history[i].rx_time = history[i].rx_time;
+            onDemand.variant.response.response_data.air_activity_history.air_activity_history[i].tx_time = history[i].tx_time;
+            onDemand.variant.response.response_data.air_activity_history.air_activity_history[i].rxBad_time = history[i].rx_bad_time;
     }
     return onDemand;
 }
@@ -664,9 +564,9 @@ meshtastic_OnDemand OnDemandModule::preparePacketHistoryLog()
     if (countE > capE) countE = capE;
     elog.exchange_list_count = (pb_size_t)countE;
     for (size_t i = 0; i < countE; i++) {
-        elog.exchange_list[i].port_num = nodeDB->packetHistoryLog.entries[i].port_num;
-        elog.exchange_list[i].from_node = nodeDB->packetHistoryLog.entries[i].from_node;
-        elog.exchange_list[i].to_node = nodeDB->packetHistoryLog.entries[i].to_node;
+        elog.exchange_list[i].port_num = router->m_packetCounter.packetHistoryLog.entries[i].port_num;
+        elog.exchange_list[i].from_node = router->m_packetCounter.packetHistoryLog.entries[i].from_node;
+        elog.exchange_list[i].to_node = router->m_packetCounter.packetHistoryLog.entries[i].to_node;
     }
     return onDemand;
 }
@@ -705,10 +605,10 @@ meshtastic_OnDemand OnDemandModule::prepareRxPacketHistory()
     auto &rxh = onDemand.variant.response.response_data.rx_packet_history;
     const size_t cap = sizeof(rxh.rx_packet_history) / sizeof(rxh.rx_packet_history[0]);
     // Align with LocalStatsExtended: index 0 = in-progress 10-min bucket, then completed buckets.
-    rxh.rx_packet_history[0] = airTime->rxPacketBucketPartial;
+    rxh.rx_packet_history[0] = router->m_packetCounter.rxPacketBucketPartial;
     size_t n = 1;
     for (; n < cap && (n - 1) < (size_t)RXTXALL_ACTIVITY_COUNT; n++) {
-        rxh.rx_packet_history[n] = airTime->rxTxAllActivities[n - 1].rxTxAll_counter;
+        rxh.rx_packet_history[n] = router->m_packetCounter.rxTxAllActivities[n - 1].rxTxAll_counter;
     }
     rxh.rx_packet_history_count = (pb_size_t)n;
 

@@ -1,124 +1,210 @@
 #include "airtime.h"
 #include "NodeDB.h"
+#include "UptimeClock.h"
 #include "configuration.h"
+#include <algorithm>
+#include <assert.h>
+#include <cmath>
+#include <string.h>
 
 AirTime *airTime = NULL;
 
-// Don't read out of this directly. Use the helper functions.
-
-uint32_t air_period_tx[PERIODS_TO_LOG];
-uint32_t air_period_rx[PERIODS_TO_LOG];
-
-//fw+
-ActivityTime activityWindow[ACTIVITY_WINDOW_COUNT] = {};
-
-void AirTime::updateActivityWindow(const ActivityTime &newData) {
-    for (int i = 0; i < ACTIVITY_WINDOW_COUNT - 1; i++) {
-        activityWindow[i] = activityWindow[i + 1];
-    }
-    activityWindow[ACTIVITY_WINDOW_COUNT - 1] = newData;
+AirTime *AirTime::Held::armReentryCheck(AirTime *a)
+{
+#ifdef AIRTIME_REENTRY_CHECK
+    // Before the lock: a nested take blocks forever, so a later check would never run.
+    assert(!a->reentryFlag);
+    a->reentryFlag = true;
+#endif
+    return a;
 }
 
-void AirTime::logAirtime(reportTypes reportType, uint32_t airtime_ms)
+AirTime::Held::~Held()
 {
+#ifdef AIRTIME_REENTRY_CHECK
+    owner->reentryFlag = false;
+#else
+    (void)owner;
+#endif
+}
 
+// --- the lock-free core -------------------------------------------------------------------------
+// Every method here requires the lock, and says so in its signature. None can take it: Windows has
+// no lock to reach.
+
+void AirTime::Windows::logAirtime(reportTypes reportType, uint32_t airtime_ms, const Held &held)
+{
+    // A packet may be logged immediately after waking from light sleep. Sync first so
+    // the packet is counted in the current wall-time bucket, not a stale awake-time bucket.
+    syncNow(held);
+
+    // The caller logs, once the lock is released.
     if (reportType == TX_LOG) {
-        LOG_DEBUG("Packet TX: %ums", airtime_ms);
         this->airtimes.periodTX[0] = this->airtimes.periodTX[0] + airtime_ms;
-        air_period_tx[0] = air_period_tx[0] + airtime_ms;
-
-        this->utilizationTX[this->getPeriodUtilHour()] = this->utilizationTX[this->getPeriodUtilHour()] + airtime_ms;
-        txAccum10 += airtime_ms;
+        this->utilizationTX[this->getPeriodUtilHour(held)] += airtime_ms;
+        this->txWindow += airtime_ms;
     } else if (reportType == RX_LOG) {
-        LOG_DEBUG("Packet RX: %ums", airtime_ms);
         this->airtimes.periodRX[0] = this->airtimes.periodRX[0] + airtime_ms;
-        air_period_rx[0] = air_period_rx[0] + airtime_ms;
-
-        currentRxWindowSum += airtime_ms; //fw+
-        currentRxWindowCount++; //fw+
-        rxAccum10 += airtime_ms; //fw+
+        this->rxWindow += airtime_ms;
+        this->rxWindowSum += airtime_ms;
+        this->rxWindowCount++;
     } else if (reportType == RX_ALL_LOG) {
-        LOG_DEBUG("Packet RX (noise?) : %ums", airtime_ms);
         this->airtimes.periodRX_ALL[0] = this->airtimes.periodRX_ALL[0] + airtime_ms;
-        currentRxWindowSum += airtime_ms;
-        currentRxWindowCount++; //fw+
-        rxBadAccum10 += airtime_ms; //fw+ 
+        this->rxBadWindow += airtime_ms;
+        this->rxWindowSum += airtime_ms;
+        this->rxWindowCount++;
     }
 
     // Log all airtime type for channel utilization
-    this->channelUtilization[this->getPeriodUtilMinute()] = channelUtilization[this->getPeriodUtilMinute()] + airtime_ms;
+    this->channelUtilization[this->getPeriodUtilMinute(held)] += airtime_ms;
 }
 
-uint8_t AirTime::currentPeriodIndex()
+uint8_t AirTime::Windows::getPeriodUtilMinute(const Held &)
 {
-    return ((getSecondsSinceBoot() / SECONDS_PER_PERIOD) % PERIODS_TO_LOG);
+    return (secSinceBoot / 10) % CHANNEL_UTILIZATION_PERIODS;
 }
 
-uint8_t AirTime::getPeriodUtilMinute()
+uint8_t AirTime::Windows::getPeriodUtilHour(const Held &)
 {
-    return (getSecondsSinceBoot() / 10) % CHANNEL_UTILIZATION_PERIODS;
+    return (secSinceBoot / 60) % MINUTES_IN_HOUR;
 }
 
-uint8_t AirTime::getPeriodUtilHour()
+void AirTime::Windows::syncNow(const Held &held)
 {
-    return (getSecondsSinceBoot() / 60) % MINUTES_IN_HOUR;
-}
+    // Monotonic uptime, not RTC/network time: a user, GPS, or NTP clock change must not move
+    // airtime accounting. Pure read; the main loop publishes the wrap carry it derives from.
+    uint32_t nowSecs = Time::getUptimeSecs();
 
-void AirTime::airtimeRotatePeriod()
-{
+    if (firstTime) {
+        memset(this->utilizationTX, 0, sizeof(this->utilizationTX));
+        memset(this->channelUtilization, 0, sizeof(this->channelUtilization));
+        memset(this->airtimes.periodTX, 0, sizeof(this->airtimes.periodTX));
+        memset(this->airtimes.periodRX, 0, sizeof(this->airtimes.periodRX));
+        memset(this->airtimes.periodRX_ALL, 0, sizeof(this->airtimes.periodRX_ALL));
 
-    if (this->airtimes.lastPeriodIndex != this->currentPeriodIndex()) {
-        LOG_DEBUG("Rotate airtimes to a new period = %u", this->currentPeriodIndex());
+        this->secSinceBoot = nowSecs;
+        firstTime = false;
+        return;
+    }
 
-        for (int i = PERIODS_TO_LOG - 2; i >= 0; --i) {
-            this->airtimes.periodTX[i + 1] = this->airtimes.periodTX[i];
-            this->airtimes.periodRX[i + 1] = this->airtimes.periodRX[i];
-            this->airtimes.periodRX_ALL[i + 1] = this->airtimes.periodRX_ALL[i];
+    if (nowSecs == this->secSinceBoot) {
+        return;
+    }
 
-            air_period_tx[i + 1] = this->airtimes.periodTX[i];
-            air_period_rx[i + 1] = this->airtimes.periodRX[i];
+    uint32_t oldSecSinceBoot = this->secSinceBoot;
+    this->secSinceBoot = nowSecs;
+
+    // Close every 10-minute window boundary crossed since the last sync. Nothing is logged between
+    // syncs, so the accumulators still hold only the window that was open at oldSecSinceBoot.
+    uint32_t elapsedActivityWindows = (nowSecs / RX_WINDOW_INTERVAL_SECONDS) - (oldSecSinceBoot / RX_WINDOW_INTERVAL_SECONDS);
+    if (elapsedActivityWindows > 0) {
+        this->closeActivityWindows(elapsedActivityWindows);
+    }
+
+    // Historical airtime reports use 1-hour buckets. If multiple hours elapsed while
+    // asleep, rotate each crossed bucket or clear the whole report window.
+    uint32_t elapsedAirtimePeriods = (this->secSinceBoot / SECONDS_PER_PERIOD) - (oldSecSinceBoot / SECONDS_PER_PERIOD);
+    if (elapsedAirtimePeriods >= PERIODS_TO_LOG) {
+        memset(this->airtimes.periodTX, 0, sizeof(this->airtimes.periodTX));
+        memset(this->airtimes.periodRX, 0, sizeof(this->airtimes.periodRX));
+        memset(this->airtimes.periodRX_ALL, 0, sizeof(this->airtimes.periodRX_ALL));
+    } else {
+        // Hand the count to runOnce() rather than tracing each crossing here: this runs under
+        // the lock, and a UART write would stall every other caller waiting on it.
+        this->rotationsPendingLog += elapsedAirtimePeriods;
+        for (uint32_t h = 0; h < elapsedAirtimePeriods; h++) {
+            for (int i = PERIODS_TO_LOG - 2; i >= 0; --i) {
+                this->airtimes.periodTX[i + 1] = this->airtimes.periodTX[i];
+                this->airtimes.periodRX[i + 1] = this->airtimes.periodRX[i];
+                this->airtimes.periodRX_ALL[i + 1] = this->airtimes.periodRX_ALL[i];
+            }
+
+            this->airtimes.periodTX[0] = 0;
+            this->airtimes.periodRX[0] = 0;
+            this->airtimes.periodRX_ALL[0] = 0;
         }
+    }
 
-        this->airtimes.periodTX[0] = 0;
-        this->airtimes.periodRX[0] = 0;
-        this->airtimes.periodRX_ALL[0] = 0;
+    // Channel utilization is a rolling 60-second view split into six 10-second buckets.
+    // Clear every bucket crossed while asleep so old airtime decays by real elapsed time.
+    uint32_t elapsedUtilPeriods = (this->secSinceBoot / 10) - (oldSecSinceBoot / 10);
+    // Fold one reading per crossed bucket, each before that bucket is cleared, so one delayed sync
+    // lands where the same number of 10 s syncs would have. Bounded: six clears empty the window.
+    const uint32_t steppedUtilPeriods = std::min<uint32_t>(elapsedUtilPeriods, CHANNEL_UTILIZATION_PERIODS);
+    for (uint32_t i = 1; i <= steppedUtilPeriods; i++) {
+        foldChannelUtil(channelUtilizationPercentRaw(held), 1, held);
+        this->channelUtilization[((oldSecSinceBoot / 10) + i) % CHANNEL_UTILIZATION_PERIODS] = 0;
+    }
+    // Anything past a full window is elapsed time against an already-empty ring, so it folds as
+    // idle in closed form rather than looping over a sleep that may have lasted days.
+    foldChannelUtil(0.0f, elapsedUtilPeriods - steppedUtilPeriods, held);
 
-        air_period_tx[0] = 0;
-        air_period_rx[0] = 0;
-
-        this->airtimes.lastPeriodIndex = this->currentPeriodIndex();
+    // TX utilization is a rolling 60-minute view used by duty-cycle checks.
+    uint32_t elapsedUtilTXPeriods = (this->secSinceBoot / 60) - (oldSecSinceBoot / 60);
+    if (elapsedUtilTXPeriods >= MINUTES_IN_HOUR) {
+        memset(this->utilizationTX, 0, sizeof(this->utilizationTX));
+    } else {
+        for (uint32_t i = 1; i <= elapsedUtilTXPeriods; i++) {
+            this->utilizationTX[((oldSecSinceBoot / 60) + i) % MINUTES_IN_HOUR] = 0;
+        }
     }
 }
 
-uint32_t *AirTime::airtimeReport(reportTypes reportType)
+void AirTime::Windows::closeActivityWindows(uint32_t elapsed)
 {
+    // The first boundary closes the window that was filling. Any later ones were idle: a window with
+    // no airtime still has its full length as idle time. Only the newest RX_WINDOW_COUNT boundaries
+    // can survive in the history, so an earlier one is skipped rather than pushed and shifted out.
+    const uint32_t windowMs = RX_WINDOW_INTERVAL_SECONDS * 1000;
+    const uint32_t usedMs = this->txWindow + this->rxWindow + this->rxBadWindow;
+    const ActivityTime closed = {this->rxWindow, this->txWindow, windowMs > usedMs ? windowMs - usedMs : 0, this->rxBadWindow};
+    const ActivityTime idle = {0, 0, windowMs, 0};
+    const uint32_t average = this->rxWindowCount > 0 ? this->rxWindowSum / this->rxWindowCount : 0;
 
+    const uint32_t first = elapsed > RX_WINDOW_COUNT ? elapsed - RX_WINDOW_COUNT : 0;
+    for (uint32_t i = first; i < elapsed; i++) {
+        for (int j = 0; j < RX_WINDOW_COUNT - 1; j++) {
+            this->rxWindowAverages[j] = this->rxWindowAverages[j + 1];
+        }
+        this->rxWindowAverages[RX_WINDOW_COUNT - 1] = (i == 0 ? average : 0);
+
+        for (int j = 0; j < ACTIVITY_WINDOW_COUNT - 1; j++) {
+            this->activityWindow[j] = this->activityWindow[j + 1];
+        }
+        this->activityWindow[ACTIVITY_WINDOW_COUNT - 1] = (i == 0 ? closed : idle);
+    }
+
+    this->txWindow = 0;
+    this->rxWindow = 0;
+    this->rxBadWindow = 0;
+    this->rxWindowSum = 0;
+    this->rxWindowCount = 0;
+}
+
+bool AirTime::Windows::airtimeReport(reportTypes reportType, uint32_t *out, size_t count, const Held &held)
+{
+    if (!out || count > PERIODS_TO_LOG)
+        return false;
+
+    // Reports may be requested before runOnce() executes after wake.
+    syncNow(held);
+
+    const uint32_t *src = nullptr;
     if (reportType == TX_LOG) {
-        return this->airtimes.periodTX;
+        src = this->airtimes.periodTX;
     } else if (reportType == RX_LOG) {
-        return this->airtimes.periodRX;
+        src = this->airtimes.periodRX;
     } else if (reportType == RX_ALL_LOG) {
-        return this->airtimes.periodRX_ALL;
+        src = this->airtimes.periodRX_ALL;
     }
-    return 0;
+    if (!src)
+        return false;
+
+    memcpy(out, src, count * sizeof(*out));
+    return true;
 }
 
-uint8_t AirTime::getPeriodsToLog()
-{
-    return PERIODS_TO_LOG;
-}
-
-uint32_t AirTime::getSecondsPerPeriod()
-{
-    return SECONDS_PER_PERIOD;
-}
-
-uint32_t AirTime::getSecondsSinceBoot()
-{
-    return this->secSinceBoot;
-}
-
-float AirTime::channelUtilizationPercent()
+float AirTime::Windows::channelUtilizationPercentRaw(const Held &)
 {
     uint32_t sum = 0;
     for (uint32_t i = 0; i < CHANNEL_UTILIZATION_PERIODS; i++) {
@@ -128,8 +214,54 @@ float AirTime::channelUtilizationPercent()
     return (float(sum) / float(CHANNEL_UTILIZATION_PERIODS * 10 * 1000)) * 100;
 }
 
-float AirTime::utilizationTXPercent()
+float AirTime::Windows::channelUtilizationPercent(const Held &held)
 {
+    // Gate decisions should see buckets that have decayed across light-sleep time.
+    syncNow(held);
+
+    return channelUtilizationPercentRaw(held);
+}
+
+void AirTime::Windows::foldChannelUtil(float sample, uint32_t steps, const Held &)
+{
+    if (steps == 0)
+        return;
+
+    if (!hasChannelUtilSample) {
+        // Seed from the first reading, or a node booting onto a busy channel reports it quiet
+        // for a whole time constant.
+        channelUtilAvg = sample;
+        hasChannelUtilSample = true;
+        steps--;
+    }
+
+    if (steps > 0) {
+        // Integer power by squaring; powf would link ~1.9 KB of float libm for this one call.
+        float base = 1.0f - 1.0f / float(CHANNEL_UTILIZATION_EMA_DIVISOR);
+        float retained = 1.0f;
+        for (uint32_t e = steps; e != 0; e >>= 1) {
+            if (e & 1)
+                retained *= base;
+            base *= base;
+        }
+        channelUtilAvg = sample + (channelUtilAvg - sample) * retained;
+    }
+}
+
+float AirTime::Windows::smoothedChannelUtilizationPercent(const Held &held)
+{
+    syncNow(held);
+
+    // Nothing folded yet before the first bucket crossing, and 0 would read as an idle channel
+    // rather than as no data.
+    return hasChannelUtilSample ? channelUtilAvg : channelUtilizationPercentRaw(held);
+}
+
+float AirTime::Windows::utilizationTXPercent(const Held &held)
+{
+    // Duty-cycle checks use this value, so keep it current even outside the periodic thread.
+    syncNow(held);
+
     uint32_t sum = 0;
     for (uint32_t i = 0; i < MINUTES_IN_HOUR; i++) {
         sum += this->utilizationTX[i];
@@ -138,32 +270,9 @@ float AirTime::utilizationTXPercent()
     return (float(sum) / float(MS_IN_HOUR)) * 100;
 }
 
-bool AirTime::isTxAllowedChannelUtil(bool polite)
-{
-    uint8_t percentage = (polite ? polite_channel_util_percent+moduleConfig.node_mod_admin.additional_polite_channel_percent : max_channel_util_percent+moduleConfig.node_mod_admin.additional_chutil);
-    if (channelUtilizationPercent() < percentage) {
-        return true;
-    } else {
-        LOG_WARN("Ch. util >%d%%. Skip send", percentage);
-        return false;
-    }
-}
-
-bool AirTime::isTxAllowedAirUtil()
-{
-    if (!config.lora.override_duty_cycle && myRegion->dutyCycle < 100) {
-        if (utilizationTXPercent() < (myRegion->dutyCycle+moduleConfig.node_mod_admin.additional_txutil) * (polite_duty_cycle_percent+moduleConfig.node_mod_admin.additional_polite_duty_cycle_percent) / 100) {
-            return true;
-        } else {
-            LOG_WARN("TX air util. >%f%%. Skip send", (myRegion->dutyCycle+moduleConfig.node_mod_admin.additional_txutil) * (polite_duty_cycle_percent+moduleConfig.node_mod_admin.additional_polite_duty_cycle_percent) / 100);
-            return false;
-        }
-    }
-    return true;
-}
-
-// Get the amount of minutes we have to be silent before we can send again
-uint8_t AirTime::getSilentMinutes(float txPercent, float dutyCycle)
+// Minutes we must be silent before sending again. Does not sync, and walks the ring as if the index
+// were an age; both are wrong and both are pinned by characterisation tests. See airtime.h's TODO.
+uint8_t AirTime::Windows::getSilentMinutes(float txPercent, float dutyCycle, const Held &)
 {
     float newTxPercent = txPercent;
     for (int8_t i = MINUTES_IN_HOUR - 1; i >= 0; --i) {
@@ -175,85 +284,150 @@ uint8_t AirTime::getSilentMinutes(float txPercent, float dutyCycle)
     return MINUTES_IN_HOUR;
 }
 
-AirTime::AirTime() : concurrency::OSThread("AirTime"), airtimes({}) {}
+// --- the locking shell --------------------------------------------------------------------------
+// Each takes the lock exactly once and delegates. Nothing below calls another method on `this`.
+
+void AirTime::logAirtime(reportTypes reportType, uint32_t airtime_ms)
+{
+    {
+        Held held(this);
+        w.logAirtime(reportType, airtime_ms, held);
+    }
+
+    // Outside the lock: DEBUG_PORT.log() blocks on a UART write, and `lock` is a plain binary
+    // semaphore with no priority inheritance, so holding it here would stall the radio thread.
+    if (reportType == TX_LOG) {
+        LOG_DEBUG("Packet TX: %ums", airtime_ms);
+    } else if (reportType == RX_LOG) {
+        LOG_DEBUG("Packet RX: %ums", airtime_ms);
+    } else if (reportType == RX_ALL_LOG) {
+        LOG_DEBUG("Packet RX (noise?) : %ums", airtime_ms);
+    }
+}
+
+void AirTime::airtimeRotatePeriod()
+{
+    // Preserve the public helper while keeping all rotation logic in one monotonic-time path.
+    Held held(this);
+    w.syncNow(held);
+}
+
+bool AirTime::airtimeReport(reportTypes reportType, uint32_t *out, size_t count)
+{
+    Held held(this);
+    return w.airtimeReport(reportType, out, count, held);
+}
+
+bool AirTime::rxWindowAverageHistory(uint32_t *out, size_t count)
+{
+    if (!out || count > RX_WINDOW_COUNT)
+        return false;
+
+    Held held(this);
+    w.syncNow(held);
+    memcpy(out, w.rxWindowAverages, count * sizeof(*out));
+    return true;
+}
+
+bool AirTime::activityWindowHistory(ActivityTime *out, size_t count)
+{
+    if (!out || count > ACTIVITY_WINDOW_COUNT)
+        return false;
+
+    Held held(this);
+    w.syncNow(held);
+    memcpy(out, w.activityWindow, count * sizeof(*out));
+    return true;
+}
+
+uint32_t AirTime::getSecondsSinceBoot()
+{
+    // Keep HTTP/debug reporting aligned with the same monotonic clock used by the buckets.
+    Held held(this);
+    w.syncNow(held);
+    return w.secSinceBoot;
+}
+
+float AirTime::channelUtilizationPercent()
+{
+    Held held(this);
+    return w.channelUtilizationPercent(held);
+}
+
+float AirTime::smoothedChannelUtilizationPercent()
+{
+    Held held(this);
+    return w.smoothedChannelUtilizationPercent(held);
+}
+
+float AirTime::utilizationTXPercent()
+{
+    Held held(this);
+    return w.utilizationTXPercent(held);
+}
+
+// These lock like everything else, because they call the core rather than the public accessors.
+// Both read under the lock and warn after it, for the reason logAirtime() does.
+bool AirTime::isTxAllowedChannelUtil(bool polite)
+{
+    uint8_t percentage = (polite ? polite_channel_util_percent : max_channel_util_percent);
+    float utilization;
+    {
+        Held held(this);
+        utilization = w.channelUtilizationPercent(held);
+    }
+
+    if (utilization < percentage)
+        return true;
+    LOG_WARN("Ch. util >%d%%. Skip send", percentage);
+    return false;
+}
+
+bool AirTime::isTxAllowedAirUtil()
+{
+    float effectiveDutyCycle = getEffectiveDutyCycle();
+    if (!config.lora.override_duty_cycle && effectiveDutyCycle < 100) {
+        // fw+: the admin's extra TX util and polite allowance widen the limit, the same way Router::send does
+        const float dutyCycleLimit = effectiveDutyCycle + float(moduleConfig.node_mod_admin.additional_txutil);
+        const float politePercent = polite_duty_cycle_percent + float(moduleConfig.node_mod_admin.additional_polite_duty_cycle_percent);
+        float limit = dutyCycleLimit * politePercent / 100;
+        float utilization;
+        {
+            Held held(this);
+            utilization = w.utilizationTXPercent(held);
+        }
+
+        if (utilization < limit)
+            return true;
+        LOG_WARN("TX air util. >%f%%. Skip send", limit);
+        return false;
+    }
+    return true;
+}
+
+uint8_t AirTime::getSilentMinutes(float txPercent, float dutyCycle)
+{
+    Held held(this);
+    return w.getSilentMinutes(txPercent, dutyCycle, held);
+}
+
+AirTime::AirTime() : concurrency::OSThread("AirTime") {}
 
 int32_t AirTime::runOnce()
 {
-    secSinceBoot++;
-
-    uint8_t utilPeriod = this->getPeriodUtilMinute();
-    uint8_t utilPeriodTX = this->getPeriodUtilHour();
-
-    if (firstTime) {
-
-        // Init utilizationTX window to all 0
-        for (uint32_t i = 0; i < MINUTES_IN_HOUR; i++) {
-            this->utilizationTX[i] = 0;
-        }
-
-        // Init channelUtilization window to all 0
-        for (uint32_t i = 0; i < CHANNEL_UTILIZATION_PERIODS; i++) {
-            this->channelUtilization[i] = 0;
-        }
-
-        // Init airtime windows to all 0
-        for (int i = 0; i < PERIODS_TO_LOG; i++) {
-            this->airtimes.periodTX[i] = 0;
-            this->airtimes.periodRX[i] = 0;
-            this->airtimes.periodRX_ALL[i] = 0;
-        }
-
-        firstTime = false;
-        lastUtilPeriod = utilPeriod;
-    } else {
-        this->airtimeRotatePeriod();
-
-        // Reset the channelUtilization window when we roll over
-        if (lastUtilPeriod != utilPeriod) {
-            lastUtilPeriod = utilPeriod;
-
-            this->channelUtilization[utilPeriod] = 0;
-        }
-
-        if (lastUtilPeriodTX != utilPeriodTX) {
-            lastUtilPeriodTX = utilPeriodTX;
-
-            this->utilizationTX[utilPeriodTX] = 0;
-        }
+    uint32_t rotations;
+    {
+        Held held(this);
+        w.syncNow(held);
+        rotations = w.rotationsPendingLog;
+        w.rotationsPendingLog = 0;
     }
 
-    //fw+ 10m window
-    if (secSinceBoot != 0 && secSinceBoot % RX_WINDOW_INTERVAL_SECONDS == 0) {
-        uint32_t window_ms = RX_WINDOW_INTERVAL_SECONDS * 1000;  
-
-        uint32_t delta_tx = txAccum10;
-        uint32_t delta_rx = rxAccum10;
-        uint32_t delta_rxBad = rxBadAccum10;
-
-        uint32_t usedTime = delta_tx + delta_rx + delta_rxBad;
-        uint32_t current_idle = (window_ms > usedTime) ? (window_ms - usedTime) : 0;
-
-        ActivityTime newActivity = { delta_rx, delta_tx, current_idle, delta_rxBad };
-        updateActivityWindow(newActivity);
-
-        txAccum10 = 0;
-        rxAccum10 = 0;
-        rxBadAccum10 = 0;
-
-        uint32_t average = (currentRxWindowCount > 0 ? currentRxWindowSum / currentRxWindowCount : 0);
-        pushNewRxWindowAverage(average);
-
-        currentRxWindowSum = 0;
-        currentRxWindowCount = 0;
+    // Outside the lock, for the reason logAirtime() gives. Any caller can cross an hour, but only
+    // this thread reports it, so a crossing raised elsewhere is traced at most one tick late.
+    if (rotations > 0) {
+        LOG_DEBUG("Rotate airtimes, crossed %u hour(s)", rotations);
     }
 
     return (1000 * 1);
-}
-
-void AirTime::pushNewRxWindowAverage(uint32_t average)
-{
-    for (int i = 0; i < RX_WINDOW_COUNT - 1; i++) {
-        rxWindowAverages[i] = rxWindowAverages[i + 1];
-    }
-    rxWindowAverages[RX_WINDOW_COUNT - 1] = average;
 }

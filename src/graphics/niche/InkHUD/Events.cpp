@@ -2,9 +2,12 @@
 
 #include "./Events.h"
 
+#include "MessageStore.h"
 #include "PowerFSM.h"
-#include "RTC.h"
+#include "UptimeClock.h"
+#include "WaypointStore.h"
 #include "buzz.h"
+#include "gps/RTC.h"
 #include "modules/ExternalNotificationModule.h"
 #include "modules/TextMessageModule.h"
 #include "sleep.h"
@@ -363,7 +366,7 @@ void InkHUD::Events::onTouchTap(uint16_t x, uint16_t y, bool longPress)
     // A long-press used to open the menu can be followed by a synthetic/queued tap at release.
     // Ignore that brief follow-up window so touch-opened menus do not auto-select an item.
     if (touchEnabledBuild && !longPress && suppressTouchTapUntilMs != 0) {
-        if ((int32_t)(millis() - suppressTouchTapUntilMs) < 0) {
+        if ((int32_t)(Time::getMillis() - suppressTouchTapUntilMs) < 0) {
             noteInkHUDUserInteraction();
             return;
         }
@@ -399,7 +402,7 @@ void InkHUD::Events::onTouchTap(uint16_t x, uint16_t y, bool longPress)
         // Only arm suppression if the long-press actually opened menu foreground.
         SystemApplet *menu = inkhud->getSystemApplet("Menu");
         if (touchEnabledBuild && menu && menu->isForeground()) {
-            suppressTouchTapUntilMs = millis() + TOUCH_MENU_OPEN_TAP_SUPPRESS_MS;
+            suppressTouchTapUntilMs = Time::timerEndsAtMillis(TOUCH_MENU_OPEN_TAP_SUPPRESS_MS);
         }
     } else
         onButtonShort();
@@ -467,6 +470,7 @@ int InkHUD::Events::beforeDeepSleep(void *unused)
 
     inkhud->persistence->saveSettings();
     inkhud->persistence->saveLatestMessage();
+    waypointStore.saveToFlash();
 
     // LogoApplet::onShutdown attempted to heal the display by drawing a "shutting down" screen twice,
     // then prepared a final powered-off screen for us, which shows device shortname.
@@ -514,6 +518,8 @@ int InkHUD::Events::beforeReboot(void *unused)
         inkhud->persistence->saveLatestMessage();
     } else {
         NicheGraphics::clearFlashData();
+        messageStore.clearAllMessages(); // also wipe the shared message store
+        waypointStore.clearAllWaypoints();
     }
 
     // Note: no forceUpdate call here
@@ -525,39 +531,40 @@ int InkHUD::Events::beforeReboot(void *unused)
 // Callback when a new text message is received
 // Caches the most recently received message, for use by applets
 // Rx does not trigger a save to flash, however the data *will* be saved alongside other during shutdown, etc.
-// Note: this is different from devicestate.rx_text_message, which may contain an *outgoing* message
+// Note: this is intentionally separate from device-state message fields.
 int InkHUD::Events::onReceiveTextMessage(const meshtastic_MeshPacket *packet)
 {
     // Short circuit: don't store outgoing messages
     if (getFrom(packet) == nodeDB->getNodeNum())
         return 0;
 
-    // Determine whether the message is broadcast or a DM
-    // Store this info to prevent confusion after a reboot
-    // Avoids need to compare timestamps, because of situation where "future" messages block newly received, if time not set
-    inkhud->persistence->latestMessage.wasBroadcast = isBroadcast(packet->to);
+    if (!messageStore.shouldStorePacket(*packet))
+        return 0;
 
-    // Pick the appropriate variable to store the message in
-    MessageStore::Message *storedMessage = inkhud->persistence->latestMessage.wasBroadcast
-                                               ? &inkhud->persistence->latestMessage.broadcast
-                                               : &inkhud->persistence->latestMessage.dm;
+    bool isBroadcastMsg = isBroadcast(packet->to);
+    inkhud->persistence->latestMessage.wasBroadcast = isBroadcastMsg;
 
-    // Store nodenum of the sender
-    // Applets can use this to fetch user data from nodedb, if they want
-    storedMessage->sender = packet->from;
-
-    // Store the time (epoch seconds) when message received
-    storedMessage->timestamp = getValidTime(RTCQuality::RTCQualityDevice, true); // Current RTC time
-
-    // Store the channel
-    // - (potentially) used to determine whether notification shows
-    // - (potentially) used to determine which applet to focus
-    storedMessage->channelIndex = packet->channel;
-
-    // Store the text
-    // Need to specify manually how many bytes, because source not null-terminated
-    storedMessage->text =
-        std::string(&packet->decoded.payload.bytes[0], &packet->decoded.payload.bytes[packet->decoded.payload.size]);
+    if (!isBroadcastMsg) {
+        // DMs never pass through ThreadedMessageApplet, so add them to the global store here
+        // so they survive reboots. Derive the latestMessage cache entry from the stored result.
+        const StoredMessage *stored = messageStore.tryAddFromPacket(*packet);
+        if (!stored)
+            return 0;
+        inkhud->persistence->latestMessage.dm = *stored;
+    } else {
+        // Broadcasts are added to the global store by ThreadedMessageApplet::handleReceived().
+        // Here we only update the latestMessage cache used by AllMessageApplet / NotificationApplet.
+        StoredMessage &sm = inkhud->persistence->latestMessage.broadcast;
+        sm.sender = packet->from;
+        sm.timestamp = getValidTime(RTCQuality::RTCQualityDevice, true);
+        sm.channelIndex = packet->channel;
+        const char *payload = reinterpret_cast<const char *>(packet->decoded.payload.bytes);
+        size_t storedLen = packet->decoded.payload.size;
+        if (storedLen >= MAX_MESSAGE_SIZE)
+            storedLen = MAX_MESSAGE_SIZE - 1;
+        sm.textOffset = MessageStore::storeText(payload, storedLen);
+        sm.textLength = static_cast<uint16_t>(storedLen);
+    }
 
     return 0; // Tell caller to continue notifying other observers. (No reason to abort this event)
 }

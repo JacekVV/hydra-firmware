@@ -11,7 +11,7 @@
 // Note: On the ESP32 base version, gpio34-39 are input-only, and do not have internal pull-ups.
 // If 39 is not being used for a button, it is suggested to remove the #define.
 #define BATTERY_PIN 35 // A battery voltage measurement pin, voltage divider connected here to measure battery voltage
-#define ADC_CHANNEL ADC1_GPIO35_CHANNEL
+#define ADC_CHANNEL ADC_CHANNEL_7 // ADC1 channel 7 = GPIO35 (IDF 5+ adc_channel_t)
 #define ADC_MULTIPLIER 1.85 // (R1 = 470k, R2 = 680k)
 #define EXT_PWR_DETECT 4    // Pin to detect connected external power source for LILYGO® TTGO T-Energy T18 and other DIY boards
 #define EXT_NOTIFY_OUT 12   // Overridden default pin to use for Ext Notify Module (#975).
@@ -22,6 +22,9 @@
 #define USE_SX1268 // E22-400M30S uses SX1268
 #define SX126X_MAX_POWER                                                                                                         \
     22 // Outputting 22dBm from SX1262 results in ~30dBm E22-900M30S output (module only uses last stage of the YP2233W PA)
+// hydra: E22P-868M30S (EU_868, HM2/HM3/HM5/HM6P/VGJ) also uses the SX1262 + 30 dBm PA: 22 dBm at the chip = ~30 dBm at the antenna.
+// 30 is NOT a valid chip setting (RadioLib range ends at 22 dBm); SX126xInterface rejects it and keeps the previous power.
+// lora.tx_power 22 = maximum usable value on these boards. Comment only: no firmware behaviour change.
 
 #ifdef EBYTE_E22
 // EBYTE E22: TCXO on DIO3 at 1.8 V (same convention as variants/esp32/diy/v1).

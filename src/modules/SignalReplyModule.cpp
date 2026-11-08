@@ -47,9 +47,10 @@ ProcessMessage SignalReplyModule::handleReceived(const meshtastic_MeshPacket &cu
         char messageReply[200];
         //fw+ Null checks to avoid potential dereference crashes
         meshtastic_NodeInfoLite *nodeSender = nodeDB->getMeshNode(currentRequest.from);
-        const char *username = (nodeSender && nodeSender->has_user) ? nodeSender->user.short_name : idSender;
+        // hydra: develop NodeInfoLite keeps names directly (short_name), there is no user sub-message
+        const char *username = (nodeSender && nodeSender->short_name[0]) ? nodeSender->short_name : idSender;
         meshtastic_NodeInfoLite *nodeReceiver = nodeDB->getMeshNode(nodeDB->getNodeNum());
-        const char *usernameja = (nodeReceiver && nodeReceiver->has_user) ? nodeReceiver->user.short_name : idReceipient;
+        const char *usernameja = (nodeReceiver && nodeReceiver->short_name[0]) ? nodeReceiver->short_name : idReceipient;
 
         //LOG_ERROR("SignalReplyModule::handleReceived(): '%s' from %s.", messageRequest, username);
 
@@ -57,6 +58,11 @@ ProcessMessage SignalReplyModule::handleReceived(const meshtastic_MeshPacket &cu
         if (hopLimit != hopStart)
         {
             snprintf(messageReply, sizeof(messageReply), "%s: indirect via %d nodes!", username, (hopsUsed));
+        }
+        else if (currentRequest.rx_rssi == 0 && currentRequest.rx_snr == 0)
+        {
+            // hydra: no radio measurement (packet came over UDP multicast between boards, rx_rssi/rx_snr are 0)
+            snprintf(messageReply, sizeof(messageReply), "'%s'->'%s' : brak RSSI/SNR (odebrane przez UDP) (@%s).", username, usernameja, usernameja);
         }
         else
         {

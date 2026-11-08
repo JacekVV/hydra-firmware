@@ -66,6 +66,7 @@ class TraceRouteModule : public ProtobufModule<meshtastic_RouteDiscovery>,
 
     // Helper to update next-hop for a single node
     void maybeSetNextHop(NodeNum target, uint8_t nextHopByte);
+
     /* Call to print the route array of a RouteDiscovery message.
        Set origin to where the request came from.
        Set dest to the ID of its destination, or NODENUM_BROADCAST if it has not yet arrived there. */
@@ -74,7 +75,7 @@ class TraceRouteModule : public ProtobufModule<meshtastic_RouteDiscovery>,
     TraceRouteRunState runState = TRACEROUTE_STATE_IDLE;
     unsigned long lastTraceRouteTime = 0;
     unsigned long resultShowTime = 0;
-    unsigned long cooldownMs = 10000;
+    unsigned long cooldownMs = 30000;
     unsigned long resultDisplayMs = 10000;
     unsigned long trackingTimeoutMs = 10000;
     String bannerText;

@@ -1,5 +1,6 @@
 .pio
 pio
+.pio-docker
 pio.tar
 web
 web.tar
@@ -15,7 +16,6 @@ web.tar
 .platformio
 .local
 .cache
-.history
 
 .DS_Store
 Thumbs.db
@@ -33,7 +33,6 @@ __pycache__
 *.swo
 *~
 
-compiled_firmware/
 venv/
 .venv/
 release/
@@ -45,11 +44,14 @@ src/mesh/raspihttp/private_key.pem
 # Ignore logo (set at build time with platformio-custom.py)
 data/boot/logo.*
 
-local_dev
 # pioarduino platform
 managed_components/*
 arduino-lib-builder*
 dependencies.lock
+
+# JLink / RTT debug artifacts (nRF SoCs)
+flash.jlink
+rtt_*.txt
 idf_component.yml
 CMakeLists.txt
 /sdkconfig.*
@@ -59,3 +61,17 @@ CMakeLists.txt
 .python3
 .claude/scheduled_tasks.lock
 userPrefs.jsonc.mcp-session-bak
+
+# Fake-NodeDB fixture pipeline (bin/regen-fake-nodedbs.sh)
+# JSONL seeds are committed (test/fixtures/nodedb/seed_v25_*.jsonl);
+# compiled .proto outputs are ephemeral build artifacts.
+build/fixtures/
+bin/_generated/
+
+# portduino WASM build (pio run -e native-wasm) + Emscripten SDK. The artifacts land in
+# .pio/build/native-wasm/ (already ignored via .pio/); these cover the retired
+# standalone emcc build's output dirs and any in-repo emsdk checkout.
+build/wasm/
+build/wasm-obj/
+build/wasm-*.log
+.emsdk/

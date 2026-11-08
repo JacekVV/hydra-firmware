@@ -27,38 +27,6 @@
  */
 class FloodingRouter : public Router
 {
-  private:
-    //fw+ Telemetry rebroadcast limiter state (60s fixed window)
-    uint32_t telemetryWindowStartMs = 0;
-    uint16_t telemetryPacketsInWindow = 0;
-    bool isTelemetryRebroadcastLimited(const meshtastic_MeshPacket *p);
-
-    //fw+ Position rebroadcast limiter - cache of last forwarded positions (LRU, fixed size)
-    struct ForwardedPositionEntry {
-      uint32_t nodeId = 0;
-      int32_t lastLat_i = 0;
-      int32_t lastLon_i = 0;
-      uint32_t lastRebroadcastMs = 0;
-    };
-    static constexpr size_t kMaxPositionEntries = 64;
-    static constexpr float kPositionRebroadcastToleranceMeters = 20.0f; //fw+
-    ForwardedPositionEntry recentForwardedPositions[kMaxPositionEntries] = {};
-    size_t recentForwardedPositionsCount = 0;
-    bool isPositionRebroadcastAllowed(const meshtastic_MeshPacket *p);
-    bool isSamePositionWithinTolerance(const ForwardedPositionEntry &entry, const meshtastic_Position &pos) const; //fw+
-    void upsertPositionEntryLRU(uint32_t nodeId, int32_t lat_i, int32_t lon_i, uint32_t nowMs);
-
-    //fw+ Opportunistic/selective flooding helpers
-    bool isOpportunisticEnabled() const;
-    bool isOpportunisticAuto() const;
-    uint32_t computeOpportunisticDelayMs(const meshtastic_MeshPacket *p) const;
-    uint32_t clampDelay(uint32_t d) const;
-    bool hasBackboneNeighbor() const;
-
-    //fw+ Counters for diagnostics
-    uint32_t opportunistic_scheduled = 0;
-    uint32_t opportunistic_canceled = 0;
-
   public:
     /**
      * Constructor
@@ -66,45 +34,6 @@ class FloodingRouter : public Router
      */
     FloodingRouter();
 
-    // Opportunistic profile categories
-    enum class OpportunisticProfile : uint8_t { SPARSE = 0, BALANCED = 1, DENSE = 2, BACKBONE_BRIDGE = 3 };
-
-    struct ProfileParams {
-      uint16_t base = 60;
-      uint16_t hop = 30;
-      uint8_t snrGain = 8;
-      uint16_t jitter = 40;
-      uint8_t backboneBias = 0; // extra earlier ms if backbone
-      // Future: cancelDeferMs, cancelMinDupes
-    };
-
-  private:
-    // Adaptive profile state (windowed)
-    OpportunisticProfile currentProfile = OpportunisticProfile::BALANCED;
-    OpportunisticProfile targetProfile = OpportunisticProfile::BALANCED;
-    uint32_t profileWindowStartMs = 0;
-    uint32_t profileWindowMs = 60000; // 60s
-    uint8_t stableWindows = 0;
-    uint8_t requiredStableWindows = 2;
-
-    // Window metrics
-    uint16_t windowBroadcastNonDup = 0; // non-duplicate broadcasts seen in window
-    uint32_t lastRxDupeCounter = 0;     // snapshot of Router::rxDupe at window start
-    uint8_t neighborsWin = 0;           // estimated local neighbor count
-    float chanUtilEma = 0.0f;           // EMA of channel utilization
-
-    // Per-profile params (can be tuned later) - set in constructor
-    ProfileParams profileParamsSparse;
-    ProfileParams profileParamsBalanced;
-    ProfileParams profileParamsDense;
-    ProfileParams profileParamsBridge;
-
-    // Adaptive helpers
-    void observeRxForProfile(const meshtastic_MeshPacket *p);
-    void maybeRecomputeProfile(uint32_t nowMs);
-    const ProfileParams &getParamsFor(OpportunisticProfile p) const;
-
-  protected:
     /**
      * Send a packet on a suitable interface.  This routine will
      * later free() the packet to pool.  This routine is not allowed to stall.
@@ -112,9 +41,7 @@ class FloodingRouter : public Router
      */
     virtual ErrorCode send(meshtastic_MeshPacket *p) override;
 
-    // Expose opportunistic info for OnDemand
-    virtual uint32_t getOpportunisticProfile() const override { return (uint32_t)currentProfile; }
-    virtual bool getOpportunisticEnabled() const override { return isOpportunisticEnabled(); }
+  protected:
     /**
      * Should this incoming filter be dropped?
      *
@@ -129,7 +56,7 @@ class FloodingRouter : public Router
     virtual void sniffReceived(const meshtastic_MeshPacket *p, const meshtastic_Routing *c) override;
 
     /* Check if we should rebroadcast this packet, and do so if needed */
-    virtual bool perhapsRebroadcast(const meshtastic_MeshPacket *p);
+    virtual bool perhapsRebroadcast(const meshtastic_MeshPacket *p) = 0;
 
     /* Check if we should handle an upgraded packet (with higher hop_limit)
      * @return true if we handled it (so stop processing)
@@ -137,7 +64,7 @@ class FloodingRouter : public Router
     bool perhapsHandleUpgradedPacket(const meshtastic_MeshPacket *p);
 
     /* Call when we receive a packet that needs some reprocessing, but afterwards should be filtered */
-    void reprocessPacket(const meshtastic_MeshPacket *p);
+    bool reprocessPacket(const meshtastic_MeshPacket *p);
 
     // Return false for roles like ROUTER which should always rebroadcast even when we've heard another rebroadcast of
     // the same packet
@@ -148,4 +75,51 @@ class FloodingRouter : public Router
 
     // Return true if we are a rebroadcaster
     bool isRebroadcaster();
+
+    // fw+ Opportunistic/selective flooding: admin-config driven delay, cancel on first hear, adaptive profile
+  public:
+    enum class OpportunisticProfile : uint8_t { SPARSE = 0, BALANCED = 1, DENSE = 2, BACKBONE_BRIDGE = 3 };
+
+    struct ProfileParams {
+        uint16_t base = 60;
+        uint16_t hop = 30;
+        uint8_t snrGain = 8;
+        uint16_t jitter = 40;
+        uint8_t backboneBias = 0; // extra earlier ms if backbone
+    };
+
+    // Expose opportunistic info for OnDemand
+    bool getOpportunisticEnabled() const override { return isOpportunisticEnabled(); }
+    uint32_t getOpportunisticProfile() const override { return (uint32_t)currentProfile; }
+
+  protected:
+    bool isOpportunisticEnabled() const;
+    bool isOpportunisticAuto() const;
+    uint32_t computeOpportunisticDelayMs(const meshtastic_MeshPacket *p) const;
+    uint32_t clampDelay(uint32_t d) const;
+    bool hasBackboneNeighbor() const;
+    void observeRxForProfile(const meshtastic_MeshPacket *p);
+    void maybeRecomputeProfile(uint32_t nowMs);
+    const ProfileParams &getParamsFor(OpportunisticProfile p) const;
+
+    uint32_t opportunistic_scheduled = 0;
+    uint32_t opportunistic_canceled = 0;
+
+  private:
+    OpportunisticProfile currentProfile = OpportunisticProfile::BALANCED;
+    OpportunisticProfile targetProfile = OpportunisticProfile::BALANCED;
+    uint32_t profileWindowStartMs = 0;
+    uint32_t profileWindowMs = 60000; // 60 s
+    uint8_t stableWindows = 0;
+    uint8_t requiredStableWindows = 2;
+
+    uint16_t windowBroadcastNonDup = 0; // non-duplicate broadcasts seen in window
+    uint32_t lastRxDupeCounter = 0;     // snapshot of rxDupe at window start
+    uint8_t neighborsWin = 0;           // estimated local neighbor count
+    float chanUtilEma = 0.0f;           // EMA of channel utilization
+
+    ProfileParams profileParamsSparse;
+    ProfileParams profileParamsBalanced;
+    ProfileParams profileParamsDense;
+    ProfileParams profileParamsBridge;
 };

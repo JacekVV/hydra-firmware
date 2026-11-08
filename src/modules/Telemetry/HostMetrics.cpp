@@ -51,7 +51,7 @@ meshtastic_MeshPacket *HostMetricsModule::allocReply()
         if (pb_decode_from_bytes(p.payload.bytes, p.payload.size, &meshtastic_HostMetrics_msg, &scratch)) {
             decoded = &scratch;
         } else {
-            LOG_ERROR("Error decoding HostMetrics module!");
+            LOG_ERROR("Can't decode HostMetrics module");
             return NULL;
         }
         // Check for a request for device metrics
@@ -70,8 +70,7 @@ meshtastic_Telemetry HostMetricsModule::getHostMetrics()
     std::string file_line;
     meshtastic_Telemetry t = meshtastic_Telemetry_init_zero;
     t.which_variant = meshtastic_Telemetry_host_metrics_tag;
-    meshtastic_HostMetrics hm = meshtastic_HostMetrics_init_zero;
-    t.variant.host_metrics = hm;
+    t.variant.host_metrics = meshtastic_HostMetrics_init_zero;
 
     if (access("/proc/uptime", R_OK) == 0) {
         std::ifstream proc_uptime("/proc/uptime");
@@ -129,6 +128,8 @@ bool HostMetricsModule::sendMetrics()
     // telemetry.variant.host_metrics.has_user_string ? telemetry.variant.host_metrics.user_string : "");
 
     meshtastic_MeshPacket *p = allocDataProtobuf(telemetry);
+    if (!p)
+        return false;
     p->to = NODENUM_BROADCAST;
     p->decoded.want_response = false;
     p->priority = meshtastic_MeshPacket_Priority_BACKGROUND;

@@ -1,15 +1,19 @@
 #include "TraceRouteModule.h"
 #include "MeshService.h"
 #include "NodeDB.h"
+#include "UptimeClock.h"
 #include "graphics/Screen.h"
 #include "graphics/ScreenFonts.h"
 #include "graphics/SharedUIDisplay.h"
 #include "mesh/Router.h"
-#include "mesh/NextHopRouter.h"
 #include "meshUtils.h"
 #include <vector>
 
-extern graphics::Screen *screen;
+#if HAS_TRAFFIC_MANAGEMENT
+#include "modules/TrafficManagementModule.h"
+#endif
+
+extern std::unique_ptr<graphics::Screen> screen;
 
 TraceRouteModule *traceRouteModule;
 
@@ -122,18 +126,6 @@ void TraceRouteModule::rebuildResultLines(OLEDDisplay *display)
 
 bool TraceRouteModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshtastic_RouteDiscovery *r)
 {
-    //fw+  Call NextHopRouter to learn routes from traceroute packets
-    // This enables ACTIVE and PASSIVE DV-ETX route learning, which is essential for DTN and mesh routing
-    // Without this, traceroute responses are logged but never used for routing decisions
-    // This was a MAJOR missing integration causing 0% DTN delivery rate
-    if (router) {
-        NextHopRouter *nh = static_cast<NextHopRouter*>(router);
-        nh->learnFromRouteDiscoveryPayload(&mp);
-        LOG_DEBUG("Traceroute: NextHopRouter learning triggered for packet id=0x%x", mp.id);
-    } else {
-        LOG_WARN("Traceroute: Router is NULL");
-    }
-    
     // We only alter the packet in alterReceivedProtobuf()
     return false; // let it be handled by RoutingModule
 }
@@ -314,6 +306,15 @@ void TraceRouteModule::updateNextHops(const meshtastic_MeshPacket &p, meshtastic
         }
         uint8_t nextHopByte = nodeDB->getLastByteOfNodeNum(nextHop);
 
+        // The route array is unauthenticated payload, so only learn from it when the node it names as our
+        // next hop is the one that actually relayed this packet to us. Otherwise a forged response could
+        // point any node's next_hop anywhere. relay_node is 0 for MQTT-sourced packets, which cannot
+        // corroborate an RF route either.
+        if (p.relay_node == NO_RELAY_NODE || nextHopByte != p.relay_node) {
+            LOG_DEBUG("Ignore traceroute next-hop 0x%02x, relayed by 0x%02x", nextHopByte, p.relay_node);
+            return;
+        }
+
         // For the rest of the nodes in the route, set their next-hop
         // Note: if we are the last in the route, this loop will not run
         for (int8_t i = nextHopIndex; i < r->route_count; i++) {
@@ -331,18 +332,19 @@ void TraceRouteModule::maybeSetNextHop(NodeNum target, uint8_t nextHopByte)
     if (target == NODENUM_BROADCAST)
         return;
 
-    // fw+: Skip if DV-ETX already has a high-confidence route (let DV-ETX take priority)
-    // This is a fallback learning mechanism; DV-ETX learning from traceroute is more sophisticated
-    if (router && router->hasRouteConfidence(target, 2)) {
-        LOG_DEBUG("Skipping legacy next-hop update for 0x%08x - DV-ETX has high confidence route", target);
-        return;
-    }
-
     meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(target);
     if (node && node->next_hop != nextHopByte) {
-        LOG_INFO("Updating legacy next-hop for 0x%08x to 0x%02x based on traceroute", target, nextHopByte);
+        LOG_INFO("Update next-hop for 0x%08x to 0x%02x via traceroute", target, nextHopByte);
         node->next_hop = nextHopByte;
     }
+
+#if HAS_TRAFFIC_MANAGEMENT
+    // Mirror into the TMM overflow cache. Traceroute is the highest-confidence
+    // source (full known route), and this captures the target even when it isn't
+    // in the hot NodeDB - same rationale as the ACK-confirmed path in NextHopRouter.
+    if (trafficManagementModule)
+        trafficManagementModule->setNextHop(target, nextHopByte);
+#endif
 }
 
 void TraceRouteModule::processUpgradedPacket(const meshtastic_MeshPacket &mp)
@@ -421,7 +423,11 @@ void TraceRouteModule::appendMyIDandSNR(meshtastic_RouteDiscovery *updated, floa
     }
 
     if (*snr_count < ROUTE_SIZE) {
-        snr_list[*snr_count] = (int8_t)(snr * 4); // Convert SNR to 1 byte
+        // Clamp before the cast: q4-scaled SNR at or below the demodulation floor can reach
+        // -128 (=-32dB), which is bit-identical to the INT8_MIN "unknown SNR" sentinel used
+        // throughout this file. Reserve -128 for the sentinel; clamp real readings to -127.
+        int32_t q4 = clamp<int32_t>(lroundf(snr * 4.0f), -127, 127);
+        snr_list[*snr_count] = (int8_t)q4;
         *snr_count += 1;
     }
     if (SNRonly)
@@ -432,7 +438,7 @@ void TraceRouteModule::appendMyIDandSNR(meshtastic_RouteDiscovery *updated, floa
         route[*route_count] = myNodeInfo.my_node_num;
         *route_count += 1;
     } else {
-        LOG_WARN("Route exceeded maximum hop limit!"); // Are you bridging networks?
+        LOG_WARN("Route exceeded max hop limit"); // Are you bridging networks?
     }
 }
 
@@ -460,7 +466,7 @@ void TraceRouteModule::printRoute(meshtastic_RouteDiscovery *r, uint32_t origin,
     // If there's a route back (or we are the destination as then the route is complete), print it
     if (r->route_back_count > 0 || origin == nodeDB->getNodeNum()) {
         route += "\n";
-        if (r->snr_towards_count > 0 && origin == nodeDB->getNodeNum())
+        if (origin == nodeDB->getNodeNum() && r->snr_back_count > 0 && r->snr_back[r->snr_back_count - 1] != INT8_MIN)
             route += vformat("(%.2fdB) 0x%x <-- ", (float)r->snr_back[r->snr_back_count - 1] / 4, origin);
         else
             route += "...";
@@ -512,12 +518,12 @@ TraceRouteModule::TraceRouteModule()
 const char *TraceRouteModule::getNodeName(NodeNum node)
 {
     meshtastic_NodeInfoLite *info = nodeDB->getMeshNode(node);
-    if (info && info->has_user) {
-        if (strlen(info->user.short_name) > 0) {
-            return info->user.short_name;
+    if (nodeInfoLiteHasUser(info)) {
+        if (strlen(info->short_name) > 0) {
+            return info->short_name;
         }
-        if (strlen(info->user.long_name) > 0) {
-            return info->user.long_name;
+        if (strlen(info->long_name) > 0) {
+            return info->long_name;
         }
     }
 
@@ -528,11 +534,11 @@ const char *TraceRouteModule::getNodeName(NodeNum node)
 
 bool TraceRouteModule::startTraceRoute(NodeNum node)
 {
-    LOG_INFO("=== TraceRoute startTraceRoute CALLED: node=0x%08x ===", node);
-    unsigned long now = millis();
+    LOG_INFO("TraceRoute startTraceRoute: node=0x%08x", node);
+    unsigned long now = Time::stampMillis();
 
     if (node == 0 || node == NODENUM_BROADCAST) {
-        LOG_ERROR("Invalid node number for trace route: 0x%08x", node);
+        LOG_ERROR("Invalid trace route node: 0x%08x", node);
         runState = TRACEROUTE_STATE_RESULT;
         setResultText("Invalid node");
         resultShowTime = millis();
@@ -546,7 +552,7 @@ bool TraceRouteModule::startTraceRoute(NodeNum node)
     }
 
     if (node == nodeDB->getNodeNum()) {
-        LOG_ERROR("Cannot trace route to self: 0x%08x", node);
+        LOG_ERROR("Can't trace route to self: 0x%08x", node);
         runState = TRACEROUTE_STATE_RESULT;
         setResultText("Cannot trace self");
         resultShowTime = millis();
@@ -562,7 +568,7 @@ bool TraceRouteModule::startTraceRoute(NodeNum node)
     if (!initialized) {
         lastTraceRouteTime = 0;
         initialized = true;
-        LOG_INFO("TraceRoute initialized for first time");
+        LOG_INFO("TraceRoute first init");
     }
 
     if (runState == TRACEROUTE_STATE_TRACKING) {
@@ -582,7 +588,7 @@ bool TraceRouteModule::startTraceRoute(NodeNum node)
         UIFrameEvent e;
         e.action = UIFrameEvent::Action::REGENERATE_FRAMESET;
         notifyObservers(&e);
-        LOG_INFO("Cooldown active, please wait %lu seconds before starting a new trace route.", wait);
+        LOG_INFO("Cooldown active, wait %lu sec before new trace route", wait);
         return false;
     }
 
@@ -593,7 +599,7 @@ bool TraceRouteModule::startTraceRoute(NodeNum node)
     clearResultLines();
     bannerText = String("Tracing ") + getNodeName(node);
 
-    LOG_INFO("TraceRoute UI: Starting trace route to node 0x%08x, requesting focus", node);
+    LOG_INFO("TraceRoute UI: Start trace to 0x%08x, request focus", node);
 
     // 请求焦点，然后触发UI更新事件
     requestFocus();
@@ -605,7 +611,7 @@ bool TraceRouteModule::startTraceRoute(NodeNum node)
     setIntervalFromNow(1000); // 每秒检查一次状态
 
     meshtastic_RouteDiscovery req = meshtastic_RouteDiscovery_init_zero;
-    LOG_INFO("Creating RouteDiscovery protobuf...");
+    LOG_INFO("Creating RouteDiscovery protobuf");
 
     // Allocate a packet directly from router like the reference code
     meshtastic_MeshPacket *p = router->allocForSending();
@@ -622,16 +628,16 @@ bool TraceRouteModule::startTraceRoute(NodeNum node)
         p->decoded.payload.size =
             pb_encode_to_bytes(p->decoded.payload.bytes, sizeof(p->decoded.payload.bytes), &meshtastic_RouteDiscovery_msg, &req);
 
-        LOG_INFO("Packet allocated successfully: to=0x%08x, portnum=%d, want_response=%d, payload_size=%d", p->to,
-                 p->decoded.portnum, p->decoded.want_response, p->decoded.payload.size);
-        LOG_INFO("About to call service->sendToMesh...");
+        LOG_INFO("Packet allocated: to=0x%08x, portnum=%d, want_response=%d, payload_size=%d", p->to, p->decoded.portnum,
+                 p->decoded.want_response, p->decoded.payload.size);
+        LOG_INFO("Calling service->sendToMesh");
 
         if (service) {
-            LOG_INFO("MeshService is available, sending packet...");
+            LOG_INFO("MeshService is available, sending packet");
             service->sendToMesh(p, RX_SRC_USER);
-            LOG_INFO("sendToMesh called successfully for trace route to node 0x%08x", node);
+            LOG_INFO("sendToMesh called for trace route to node 0x%08x", node);
         } else {
-            LOG_ERROR("MeshService is NULL!");
+            LOG_ERROR("MeshService is NULL");
             runState = TRACEROUTE_STATE_RESULT;
             setResultText("Service unavailable");
             resultShowTime = millis();
@@ -644,7 +650,7 @@ bool TraceRouteModule::startTraceRoute(NodeNum node)
             return false;
         }
     } else {
-        LOG_ERROR("Failed to allocate TraceRoute packet from router");
+        LOG_ERROR("TraceRoute packet alloc from router failed");
         runState = TRACEROUTE_STATE_RESULT;
         setResultText("Failed to send");
         resultShowTime = millis();
@@ -662,7 +668,7 @@ bool TraceRouteModule::startTraceRoute(NodeNum node)
 void TraceRouteModule::launch(NodeNum node)
 {
     if (node == 0 || node == NODENUM_BROADCAST) {
-        LOG_ERROR("Invalid node number for trace route: 0x%08x", node);
+        LOG_ERROR("Invalid trace route node: 0x%08x", node);
         runState = TRACEROUTE_STATE_RESULT;
         setResultText("Invalid node");
         resultShowTime = millis();
@@ -676,7 +682,7 @@ void TraceRouteModule::launch(NodeNum node)
     }
 
     if (node == nodeDB->getNodeNum()) {
-        LOG_ERROR("Cannot trace route to self: 0x%08x", node);
+        LOG_ERROR("Can't trace route to self: 0x%08x", node);
         runState = TRACEROUTE_STATE_RESULT;
         setResultText("Cannot trace self");
         resultShowTime = millis();
@@ -692,10 +698,10 @@ void TraceRouteModule::launch(NodeNum node)
     if (!initialized) {
         lastTraceRouteTime = 0;
         initialized = true;
-        LOG_INFO("TraceRoute initialized for first time");
+        LOG_INFO("TraceRoute first init");
     }
 
-    unsigned long now = millis();
+    unsigned long now = Time::stampMillis();
     if (initialized && lastTraceRouteTime > 0 && now - lastTraceRouteTime < cooldownMs) {
         unsigned long wait = (cooldownMs - (now - lastTraceRouteTime)) / 1000;
         bannerText = String("Wait for ") + String(wait) + String("s");
@@ -707,7 +713,7 @@ void TraceRouteModule::launch(NodeNum node)
         UIFrameEvent e;
         e.action = UIFrameEvent::Action::REGENERATE_FRAMESET;
         notifyObservers(&e);
-        LOG_INFO("Cooldown active, please wait %lu seconds before starting a new trace route.", wait);
+        LOG_INFO("Cooldown active, wait %lu sec before new trace route", wait);
         return;
     }
 
@@ -727,7 +733,7 @@ void TraceRouteModule::launch(NodeNum node)
     setIntervalFromNow(1000);
 
     meshtastic_RouteDiscovery req = meshtastic_RouteDiscovery_init_zero;
-    LOG_INFO("Creating RouteDiscovery protobuf...");
+    LOG_INFO("Creating RouteDiscovery protobuf");
 
     meshtastic_MeshPacket *p = router->allocForSending();
     if (p) {
@@ -741,21 +747,21 @@ void TraceRouteModule::launch(NodeNum node)
         p->decoded.payload.size =
             pb_encode_to_bytes(p->decoded.payload.bytes, sizeof(p->decoded.payload.bytes), &meshtastic_RouteDiscovery_msg, &req);
 
-        LOG_INFO("Packet allocated successfully: to=0x%08x, portnum=%d, want_response=%d, payload_size=%d", p->to,
-                 p->decoded.portnum, p->decoded.want_response, p->decoded.payload.size);
+        LOG_INFO("Packet allocated: to=0x%08x, portnum=%d, want_response=%d, payload_size=%d", p->to, p->decoded.portnum,
+                 p->decoded.want_response, p->decoded.payload.size);
 
         if (service) {
             service->sendToMesh(p, RX_SRC_USER);
-            LOG_INFO("sendToMesh called successfully for trace route to node 0x%08x", node);
+            LOG_INFO("sendToMesh called for trace route to node 0x%08x", node);
         } else {
-            LOG_ERROR("MeshService is NULL!");
+            LOG_ERROR("MeshService is NULL");
             runState = TRACEROUTE_STATE_RESULT;
             setResultText("Service unavailable");
             resultShowTime = millis();
             tracingNode = 0;
         }
     } else {
-        LOG_ERROR("Failed to allocate TraceRoute packet from router");
+        LOG_ERROR("TraceRoute packet alloc from router failed");
         runState = TRACEROUTE_STATE_RESULT;
         setResultText("Failed to send");
         resultShowTime = millis();
@@ -770,7 +776,7 @@ void TraceRouteModule::handleTraceRouteResult(const String &result)
     resultShowTime = millis();
     tracingNode = 0;
 
-    LOG_INFO("TraceRoute result ready, requesting focus. Result: %s", result.c_str());
+    LOG_INFO("TraceRoute result ready, request focus: %s", result.c_str());
 
     setIntervalFromNow(1000);
 
@@ -779,7 +785,7 @@ void TraceRouteModule::handleTraceRouteResult(const String &result)
     e.action = UIFrameEvent::Action::REGENERATE_FRAMESET;
     notifyObservers(&e);
 
-    LOG_INFO("=== TraceRoute handleTraceRouteResult END ===");
+    LOG_INFO("TraceRoute handleTraceRouteResult END");
 }
 
 bool TraceRouteModule::shouldDraw()
@@ -837,7 +843,7 @@ void TraceRouteModule::drawFrame(OLEDDisplay *display, OLEDDisplayUiState *state
 #endif // HAS_SCREEN
 int32_t TraceRouteModule::runOnce()
 {
-    unsigned long now = millis();
+    unsigned long now = Time::stampMillis();
 
     if (runState == TRACEROUTE_STATE_IDLE) {
         return INT32_MAX;
@@ -845,7 +851,7 @@ int32_t TraceRouteModule::runOnce()
 
     // Check for tracking timeout
     if (runState == TRACEROUTE_STATE_TRACKING && now - lastTraceRouteTime > trackingTimeoutMs) {
-        LOG_INFO("TraceRoute timeout, no response received");
+        LOG_INFO("TraceRoute timeout, no response");
         runState = TRACEROUTE_STATE_RESULT;
         setResultText("No response received");
         resultShowTime = now;
@@ -881,7 +887,7 @@ int32_t TraceRouteModule::runOnce()
             return 1000;
         } else {
             // Cooldown finished
-            LOG_INFO("TraceRoute cooldown finished, returning to IDLE");
+            LOG_INFO("TraceRoute cooldown done, return to IDLE");
             runState = TRACEROUTE_STATE_IDLE;
             resultText = "";
             clearResultLines();

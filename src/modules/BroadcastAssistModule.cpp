@@ -453,8 +453,13 @@ bool BroadcastAssistModule::existsActiveFarBackbone(uint32_t minDistanceMeters, 
         return false;
     }
     
-    int32_t currentLat = self->position.latitude_i;
-    int32_t currentLon = self->position.longitude_i;
+    meshtastic_PositionLite selfPos = meshtastic_PositionLite_init_zero;
+    if (!nodeDB->copyNodePosition(self->num, selfPos)) {
+        cachedFarBackboneResult = false;
+        return false;
+    }
+    int32_t currentLat = selfPos.latitude_i;
+    int32_t currentLon = selfPos.longitude_i;
     
     //PERFORMANCE: Check if cache is valid:
     // 1. Not expired (within cache time)
@@ -488,14 +493,16 @@ bool BroadcastAssistModule::existsActiveFarBackbone(uint32_t minDistanceMeters, 
         if (sinceLastSeen(n) > freshSecs) continue;
         
         // role gate: consider only router/repeater/router_late
-        auto role = n->user.role;
+        auto role = n->role;
         bool isBackbone = role == meshtastic_Config_DeviceConfig_Role_ROUTER ||
                           role == meshtastic_Config_DeviceConfig_Role_REPEATER ||
                           role == meshtastic_Config_DeviceConfig_Role_ROUTER_LATE;
         if (!isBackbone) continue;
 
-        double lat = n->position.latitude_i * 1e-7;
-        double lon = n->position.longitude_i * 1e-7;
+        meshtastic_PositionLite nPos = meshtastic_PositionLite_init_zero;
+        if (!nodeDB->copyNodePosition(n->num, nPos)) continue;
+        double lat = nPos.latitude_i * 1e-7;
+        double lon = nPos.longitude_i * 1e-7;
         float dist = GeoCoord::latLongToMeter(selfLat, selfLon, lat, lon);
         
         if (dist >= (float)minDistanceMeters) {

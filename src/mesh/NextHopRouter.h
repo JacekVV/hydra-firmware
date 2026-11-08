@@ -1,9 +1,8 @@
 #pragma once
 
 #include "FloodingRouter.h"
+#include <map>
 #include <optional>
-#include <unordered_map>
-#include "mesh/generated/meshtastic/heard.pb.h" //fw+
 
 /**
  * An identifier for a globally unique message - a pair of the sending nodenum and the packet id assigned
@@ -14,6 +13,7 @@ struct GlobalPacketId {
     PacketId id;
 
     bool operator==(const GlobalPacketId &p) const { return node == p.node && id == p.id; }
+    bool operator<(const GlobalPacketId &p) const { return node != p.node ? node < p.node : id < p.id; }
 
     explicit GlobalPacketId(const meshtastic_MeshPacket *p)
     {
@@ -40,15 +40,34 @@ struct PendingPacket {
     /** Starts at NUM_RETRANSMISSIONS -1 and counts down.  Once zero it will be removed from the list */
     uint8_t numRetransmissions = 0;
 
+    /** Initial remaining retry count, used to detect whether a retry has fired. */
+    uint8_t initialNumRetransmissions = 0;
+
     PendingPacket() {}
     explicit PendingPacket(meshtastic_MeshPacket *p, uint8_t numRetransmissions);
 };
 
-class GlobalPacketIdHashFunction
-{
-  public:
-    size_t operator()(const GlobalPacketId &p) const { return (std::hash<NodeNum>()(p.node)) ^ (std::hash<PacketId>()(p.id)); }
+/**
+ * RAM-only per-destination route health. Tracks how fresh a learned next_hop is and how many
+ * consecutive directed deliveries to it have failed, so getNextHop() can proactively decay a stale or
+ * repeatedly-failing route back to flooding instead of trusting a dead hop on the next (and on dense
+ * meshes, slowest) attempt. Not persisted: the learned next_hop itself lives in NodeInfoLite; this is
+ * just freshness/failure metadata.
+ */
+struct RouteHealth {
+    NodeNum dest = 0;                             ///< destination this record describes; 0 == empty slot
+    uint32_t learnedAtMsec = 0;                   ///< millis() when next_hop was last (re)learned (rollover-aware)
+    uint8_t consecutiveFailures = 0;              ///< directed deliveries to `dest` that went un-ACKed
+    uint8_t lastNextHop = NO_NEXT_HOP_PREFERENCE; ///< the relay byte this health refers to
 };
+
+// M4 (optional, off by default): when a route is not proven healthy, fall back to flooding one retry
+// earlier instead of spending a second directed attempt. Trades airtime for recovery latency on dense
+// meshes; leaves the sparse-mesh happy path (fresh, verified routes) unchanged. Measure on the
+// simulator before enabling broadly.
+#ifndef NEXTHOP_EARLY_FLOOD_ON_UNVERIFIED
+#define NEXTHOP_EARLY_FLOOD_ON_UNVERIFIED 0
+#endif
 
 /*
   Router for direct messages, which only relays if it is the next hop for a packet. The next hop is set by the current
@@ -56,8 +75,8 @@ class GlobalPacketIdHashFunction
   Namely, in the PacketHistory, we keep track of (up to 3) relayers of a packet. When the ACK is delivered back to us via a node
   that also relayed the original packet, we use that node as next hop for the destination from then on. This makes sure that only
   when there’s a two-way connection, we assign a next hop. Both the ReliableRouter and NextHopRouter will do retransmissions (the
-  NextHopRouter only 1 time). For the final retry, if no one actually relayed the packet, it will reset the next hop in order to
-  fall back to the FloodingRouter again. Note that thus also intermediate hops will do a single retransmission if the intended
+  NextHopRouter only a small number of times). For the final retry, if no one actually relayed the packet, it will reset the next
+  hop in order to fall back to the FloodingRouter again. Intermediate hops also do bounded retransmissions if the intended
   next-hop didn’t relay, in order to fix changes in the middle of the route.
 */
 class NextHopRouter : public FloodingRouter
@@ -69,8 +88,30 @@ class NextHopRouter : public FloodingRouter
      */
     NextHopRouter();
 
-    NextHopRouter *asNextHopRouter() override { return this; }
-    const NextHopRouter *asNextHopRouter() const override { return this; }
+    /// fw+: one next-hop entry for OnDemand route snapshots (same fields as the fork).
+    struct PublicRouteEntry {
+        uint32_t dest;
+        uint8_t next_hop;
+        float aggregated_cost;
+        uint8_t confidence;
+        uint32_t lastUpdatedMs;
+    };
+
+    /// fw+: next-hop snapshot. develop keeps next hops per node in NodeDB, not in a route table, so every
+    /// node with a known next hop is listed. Cost and confidence are not tracked on develop and are 0.
+    /// includeStale is accepted for the fork's signature; stale entries are not filtered here.
+    std::vector<PublicRouteEntry> getRouteSnapshot(bool includeStale = false)
+    {
+        std::vector<PublicRouteEntry> out;
+        if (!nodeDB) return out;
+        const NodeNum self = nodeDB->getNodeNum();
+        for (size_t i = 0; i < nodeDB->getNumMeshNodes(); ++i) {
+            const meshtastic_NodeInfoLite *n = nodeDB->getMeshNodeByIndex(i);
+            if (!n || n->num == self || n->next_hop == 0) continue;
+            out.push_back(PublicRouteEntry{n->num, n->next_hop, 0.0f, 0, n->last_heard * 1000u});
+        }
+        return out;
+    }
 
     /**
      * Send a packet
@@ -91,111 +132,45 @@ class NextHopRouter : public FloodingRouter
         return min(d, r);
     }
 
-    // The number of retransmissions intermediate nodes will do (actually 1 less than this)
-    constexpr static uint8_t NUM_INTERMEDIATE_RETX = 2;
-    // The number of retransmissions the original sender will do
+    // Total attempts for directed hop-level delivery, including the initial send.
+    constexpr static uint8_t NUM_INTERMEDIATE_RETX = 3;
+    // Existing reliable broadcast budget, including the initial send.
     constexpr static uint8_t NUM_RELIABLE_RETX = 3;
+    // Total attempts for acknowledged unicast from the originating node.
+    constexpr static uint8_t NUM_RELIABLE_UNICAST_ATTEMPTS = 5;
 
-    //fw+ Adapt DV-ETX using S&F custody signals (override Router's no-op)
-    void rewardRouteOnDelivered(PacketId originalId, NodeNum sourceNode, uint8_t viaHopLastByte, int8_t rxSnr) override;
-    void penalizeRouteOnFailed(PacketId originalId, NodeNum sourceNode, uint8_t viaHopLastByte, uint32_t reasonCode) override;
+    // M3: bounded RAM route-health table (reuse-oldest eviction, like PacketHistory)
+    constexpr static uint8_t ROUTE_HEALTH_MAX = 32;              // ~12B/slot -> ~384B
+    constexpr static uint32_t ROUTE_TTL_MSEC = 30UL * 60 * 1000; // re-discover a route unconfirmed for 30 min
+    constexpr static uint8_t ROUTE_FAILURE_THRESHOLD = 3;        // consecutive un-ACKed directed deliveries -> dead
 
-    //fw+ PUBLIC API for route learning from traceroute packets (called by TraceRouteModule)
-    // This enables ACTIVE and PASSIVE DV-ETX learning from traceroute responses
-    void learnFromRouteDiscoveryPayload(const meshtastic_MeshPacket *p);
-    
-    //fw+ PUBLIC API for route learning from DTN custody chains (called by DtnOverlayModule)
-    // This enables PASSIVE DV-ETX learning from observed DTN custody paths
-    void learnFromDtnCustodyPath(const uint32_t *path, size_t pathLen);
+    constexpr static uint8_t OPAQUE_SEEN_MAX = 32; // opaque-relay dedup slots (see relayOpaquePacket); ~8B/slot -> ~256B
 
   protected:
     /**
      * Pending retransmissions
      */
-    std::unordered_map<GlobalPacketId, PendingPacket, GlobalPacketIdHashFunction> pending;
+    std::map<GlobalPacketId, PendingPacket> pending; // std::map keeps the libstdc++ hashtable out of small images
 
-    //fw+ dv-etx, passive DV-ETX (lightweight, optional)
-    struct RouteEntry {
-        uint8_t next_hop = NO_NEXT_HOP_PREFERENCE; // last-byte id
-        float aggregated_cost = 0.0f;               // simple scalar cost
-        uint8_t confidence = 0;                    // how sure we are (seen successes)
-        uint32_t lastUpdatedMs = 0;
-        uint8_t backup_next_hop = NO_NEXT_HOP_PREFERENCE; // secondary candidate
-        float backup_cost = 0.0f;
+    /**
+     * Per-destination route health (M3). Bounded array, reuse-oldest eviction. RAM-only.
+     */
+    RouteHealth routeHealth[ROUTE_HEALTH_MAX] = {};
+
+    /**
+     * Recently-seen opaque (undecryptable) frames, keyed on the outer (from,id) header. A second,
+     * isolated PacketHistory-style dedup: it bounds broadcast amplification of frames we can't decrypt
+     * WITHOUT admitting them to the real PacketHistory/NodeDB, so unauthenticated traffic can never
+     * influence routing / ACK / next-hop decisions. Fixed-size ring, round-robin (FIFO) eviction, no
+     * timestamps (a stale (from,id) can't false-match: packet ids are effectively random, and a real
+     * entry never has id 0 - relayOpaquePacket drops id 0 before this). RAM-only.
+     */
+    struct OpaqueSeen {
+        NodeNum sender = 0;
+        PacketId id = 0; // 0 == empty/unused slot
     };
-
-    std::unordered_map<uint32_t, RouteEntry> routes; // dest_node_id -> route
-
-    //fw+ proactive traceroute scheduler state
-    uint32_t lastHeardTracerouteMs = 0;
-    uint32_t lastProbeGlobalMs = 0;
-    uint32_t probesTodayCounter = 0;
-    uint32_t probesDayStartMs = 0;
-    std::unordered_map<uint32_t, uint32_t> perDestLastHeardRouteMs; // dest -> last heard traceroute time
-    std::unordered_map<uint32_t, uint32_t> perDestLastProbeMs;      // dest -> last probe time
-
-    bool isRouteStale(const RouteEntry &r, uint32_t now) const
-    {
-        uint32_t ttlMs = computeRouteTtlMs(r.confidence);
-        // Treat as stale if age exceeds 75% of TTL
-        return (now - r.lastUpdatedMs) > (ttlMs - ttlMs / 4);
-    }
-
-    float computeStaleRatio(uint32_t now) const
-    {
-        size_t total = 0, stale = 0;
-        for (const auto &kv : routes) {
-            const RouteEntry &r = kv.second;
-            if (r.next_hop == NO_NEXT_HOP_PREFERENCE) continue;
-            total++;
-            if (isRouteStale(r, now)) stale++;
-        }
-        if (total == 0) return 0.0f;
-        return (float)stale * 100.0f / (float)total;
-    }
-
-    bool canProbeGlobal(uint32_t now) const;
-    bool canProbeDest(uint32_t dest, uint32_t now) const;
-    bool maybeScheduleTraceroute(uint32_t now);
-    bool sendTracerouteTo(uint32_t dest);
-    // Config-driven thresholds
-    float getHysteresisThreshold() const;
-    uint8_t getMinConfidenceToUse() const;
-    //fw+ dv-etx
-    bool lookupRoute(uint32_t dest, RouteEntry &out);
-    void learnRoute(uint32_t dest, uint8_t viaHop, float observedCost);
-    void invalidateRoute(uint32_t dest, float penalty = 1.0f);
-    float estimateEtxFromSnr(float snr) const;
-    // fw+ nexthop snif (learnFromRouteDiscoveryPayload now in public section above)
-    void learnFromRoutingPayload(const meshtastic_MeshPacket *p);
-    void processPathAndLearn(const uint32_t *path, size_t maxHops,
-                             const int8_t *snrList, size_t maxSnr,
-                             const meshtastic_MeshPacket *p);
-    bool isDirectNeighborLastByte(uint8_t lastByte) const
-    {
-        // Scan known nodes for any with matching last byte that are direct (hops_away == 0)
-        int totalNodes = nodeDB->getNumMeshNodes();
-        for (int i = 0; i < totalNodes; ++i) {
-            meshtastic_NodeInfoLite *n = nodeDB->getMeshNodeByIndex(i);
-            if (!n) continue;
-            if (n->hops_away == 0 && (uint8_t)(n->num & 0xFF) == lastByte) return true;
-        }
-        return false;
-    }
-    
-    //fw+ HeardAssist throttle state
-    struct HeardThrottlePolicy {
-        uint8_t percent_per_ring[8] = {0}; // index 1..7 used
-        uint32_t jitter_base_ms = 0;
-        uint32_t jitter_slope_ms = 0;
-        uint8_t scope_min_ring = 0;
-        uint32_t active_until_ms = 0;
-        bool isActive(uint32_t now) const { return now < active_until_ms; }
-    };
-    HeardThrottlePolicy heardThrottle;
-
-    bool shouldRelayTextWithThrottle(const meshtastic_MeshPacket *p, uint32_t &outJitterMs) const; //fw+
-
+    OpaqueSeen opaqueSeen[OPAQUE_SEEN_MAX] = {};
+    uint8_t opaqueSeenNext = 0; // ring write cursor (round-robin eviction)
 
     /**
      * Should this incoming filter be dropped?
@@ -204,6 +179,10 @@ class NextHopRouter : public FloodingRouter
      * @return true to abandon the packet
      */
     virtual bool shouldFilterReceived(const meshtastic_MeshPacket *p) override;
+    bool relayOpaquePacket(const meshtastic_MeshPacket *p) override;
+    // Dedup helper for relayOpaquePacket: true if (from,id) is already recorded; otherwise records it
+    // (round-robin eviction) and returns false. Pure function of the table - no clock.
+    bool opaqueWasSeenRecently(NodeNum from, PacketId id);
 
     /**
      * Look for packets we need to relay
@@ -220,6 +199,8 @@ class NextHopRouter : public FloodingRouter
      * Add p to the list of packets to retransmit occasionally.  We will free it once we stop retransmitting.
      */
     PendingPacket *startRetransmission(meshtastic_MeshPacket *p, uint8_t numReTx = NUM_INTERMEDIATE_RETX);
+
+    ErrorCode sendWithNextHop(meshtastic_MeshPacket *p, bool trackRetransmission);
 
     // Return true if we're allowed to cancel a packet in the txQueue (so we may never transmit it even once)
     bool roleAllowsCancelingFromTxQueue(const meshtastic_MeshPacket *p);
@@ -241,73 +222,60 @@ class NextHopRouter : public FloodingRouter
 
     void setNextTx(PendingPacket *pending);
 
+    // --- M3 route-health helpers (RAM-only). Protected so ReliableRouter (a subclass) can record
+    // delivery success, and so the unit-test shim can reach them via `using`. All take `now` where
+    // time matters so the decay logic is pure and testable without a clock mock. ---
+
+    /// @return the health record for `dest`, or nullptr if we hold none.
+    RouteHealth *findRouteHealth(NodeNum dest);
+    /// @return an existing record for `dest`, else a freshly claimed slot (reuse-oldest on overflow).
+    RouteHealth *getOrAllocRouteHealth(NodeNum dest, uint32_t now);
+    /// Record that we (re)learned `nextHop` for `dest`. Resets the failure count only when the hop
+    /// changed (so a flapping reverse-path re-learn of the same dead hop still ages out).
+    void noteRouteLearned(NodeNum dest, uint8_t nextHop, uint32_t now);
+    /// Record an end-to-end delivery success to `dest` (clears failures, refreshes freshness).
+    void noteRouteSuccess(NodeNum dest, uint32_t now);
+    /// Record that a directed delivery to `dest` went un-ACKed (no-op if we hold no record).
+    void noteRouteFailure(NodeNum dest);
+    /// @return true if the route is too old (TTL) or has failed too many times in a row.
+    bool isRouteStale(const RouteHealth &h, uint32_t now) const;
+    /// Forget any health record for `dest`.
+    void clearRouteHealth(NodeNum dest);
+
+#ifdef PIO_UNIT_TESTING
+  public: // expose getNextHop to the test shim without widening production visibility
+#else
   private:
+#endif
     /**
      * Get the next hop for a destination, given the relay node
      * @return the node number of the next hop, 0 if no preference (fallback to FloodingRouter)
      */
     std::optional<uint8_t> getNextHop(NodeNum to, uint8_t relay_node);
 
+#ifdef PIO_UNIT_TESTING
+  public: // expose perhapsRebroadcast to the test shim
+#else
+  private:
+#endif
     /** Check if we should be rebroadcasting this packet if so, do so.
      *  @return true if we did rebroadcast */
     bool perhapsRebroadcast(const meshtastic_MeshPacket *p) override;
 
-  public:
-    //fw+ Public API for route introspection
-    struct PublicRouteEntry {
-        uint32_t dest;
-        uint8_t next_hop;
-        float aggregated_cost;
-        uint8_t confidence;
-        uint32_t lastUpdatedMs;
+    // fw+ limiters, both off by default (node_mod_admin). Telemetry: at most N relayed packets a minute.
+    // Position: a node's unchanged position is relayed at most once per threshold.
+    bool isTelemetryRebroadcastLimited(const meshtastic_MeshPacket *p);
+    bool isPositionRebroadcastAllowed(const meshtastic_MeshPacket *p);
+    uint32_t telemetryWindowStartMs = 0;
+    uint16_t telemetryPacketsInWindow = 0;
+    struct ForwardedPosition {
+        NodeNum nodeId;
+        int32_t latitudeI;
+        int32_t longitudeI;
+        uint32_t lastRelayMs;
     };
-
-    //fw+ Adaptive TTL: base + per-confidence increment, clamped to max
-    constexpr static uint32_t ROUTE_TTL_BASE_MS = 24UL * 60UL * 60UL * 1000UL;   // 24 hours
-    constexpr static uint32_t ROUTE_TTL_PER_CONF_MS = 12UL * 60UL * 60UL * 1000UL; // +12 hours per confidence
-    constexpr static uint32_t ROUTE_TTL_MAX_MS = 7UL * 24UL * 60UL * 60UL * 1000UL; // cap at 7 days
-
-    static uint32_t computeRouteTtlMs(uint8_t confidence)
-    {
-        // Allow admin overrides if set (>0)
-        uint32_t baseMs = ROUTE_TTL_BASE_MS;
-        uint32_t perConfMs = ROUTE_TTL_PER_CONF_MS;
-        uint32_t maxMs = ROUTE_TTL_MAX_MS;
-        if (moduleConfig.has_node_mod_admin) {
-            if (moduleConfig.node_mod_admin.route_ttl_base_hours) baseMs = moduleConfig.node_mod_admin.route_ttl_base_hours * 3600000UL;
-            if (moduleConfig.node_mod_admin.route_ttl_per_conf_hours) perConfMs = moduleConfig.node_mod_admin.route_ttl_per_conf_hours * 3600000UL;
-            if (moduleConfig.node_mod_admin.route_ttl_max_hours) maxMs = moduleConfig.node_mod_admin.route_ttl_max_hours * 3600000UL;
-        }
-        uint64_t ttl = baseMs + (uint64_t)confidence * perConfMs;
-        if (ttl > maxMs) ttl = maxMs;
-        return (uint32_t)ttl;
-    }
-
-    std::vector<PublicRouteEntry> getRouteSnapshot(bool includeStale = false) const
-    {
-        std::vector<PublicRouteEntry> out;
-        out.reserve(routes.size());
-        uint32_t now = millis();
-        for (const auto &kv : routes) {
-            const uint32_t dest = kv.first;
-            const RouteEntry &r = kv.second;
-            if (!includeStale) {
-                uint32_t ttlMs = computeRouteTtlMs(r.confidence);
-                if (now - r.lastUpdatedMs > ttlMs) continue;
-                // Visibility threshold aligned with routing usage threshold
-                if (r.confidence < getMinConfidenceToUse()) continue;
-            }
-            PublicRouteEntry e{dest, r.next_hop, r.aggregated_cost, r.confidence, r.lastUpdatedMs};
-            out.push_back(e);
-        }
-        return out;
-    }
-
-    //fw+ expose confidence check to callers without RTTI
-    bool hasRouteConfidence(NodeNum dest, uint8_t minConf) const override
-    {
-        auto snap = getRouteSnapshot(true);
-        for (const auto &e : snap) if (e.dest == dest) return e.confidence >= minConf;
-        return false;
-    }
+    static const size_t FORWARDED_POSITIONS = 32;
+    ForwardedPosition forwardedPositions[FORWARDED_POSITIONS] = {};
+    size_t forwardedPositionsCount = 0;
+    void rememberForwardedPosition(NodeNum nodeId, int32_t latitudeI, int32_t longitudeI, uint32_t nowMs);
 };

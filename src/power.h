@@ -4,8 +4,13 @@
 #include "configuration.h"
 
 #ifdef ARCH_ESP32
-// "legacy adc calibration driver is deprecated, please migrate to use esp_adc/adc_cali.h and esp_adc/adc_cali_scheme.h
-#include <esp_adc_cal.h>
+// #include <driver/adc.h>
+#include <esp_idf_version.h>
+#if ESP_IDF_VERSION_MAJOR >= 5 // hydra: esp_adc/* (oneshot + calibration) exists only in ESP-IDF 5; IDF 4.4 uses Arduino analogReadMilliVolts
+#include <esp_adc/adc_cali.h>
+#include <esp_adc/adc_cali_scheme.h>
+#include <esp_adc/adc_oneshot.h>
+#endif
 #include <soc/adc_channel.h>
 #endif
 
@@ -15,7 +20,7 @@
 
 // Device specific curves go in variant.h
 #ifndef OCV_ARRAY
-#if defined(ARCH_STM32WL) && BATTERY_PIN == AVBAT
+#if defined(ARCH_STM32) && BATTERY_PIN == AVBAT
 // STM32 VDD/VBAT absolute maximum is 4V so use an LFP curve
 #define OCV_ARRAY 3650, 3400, 3340, 3320, 3300, 3280, 3270, 3260, 3240, 3200, 2500
 #else
@@ -28,10 +33,11 @@
 #define NUM_CELLS 1
 #endif
 
-#ifdef BAT_MEASURE_ADC_UNIT
-extern RTC_NOINIT_ATTR uint64_t RTC_reg_b;
-#include "soc/sens_reg.h" // needed for adc pin reset
-#endif
+/// Consecutive below-cutoff readings needed before the low-battery deep sleep fires.
+static constexpr uint8_t LOW_VOLTAGE_READINGS_BEFORE_SHUTDOWN = 10;
+
+/// Advance the low-battery shutdown counter by one reading; true once the device should deep sleep.
+bool updateLowVoltageCounter(uint8_t &counter, bool hasBattery, bool hasUsb, uint16_t battMv, uint16_t cutoffMv);
 
 #if HAS_TELEMETRY && !MESHTASTIC_EXCLUDE_ENVIRONMENTAL_SENSOR
 #include "modules/Telemetry/Sensor/nullSensor.h"
@@ -96,11 +102,12 @@ class Power : public concurrency::OSThread
 
     void powerCommandsCheck();
     void readPowerStatus();
+    void logHeapUsage();
     virtual bool setup();
     virtual int32_t runOnce() override;
     void setStatusHandler(meshtastic::PowerStatus *handler) { statusHandler = handler; }
     const uint16_t OCV[11] = {OCV_ARRAY};
-    bool isLowBattery() { return low_voltage_counter >= 10; };
+    bool isLowBattery() { return low_voltage_counter >= LOW_VOLTAGE_READINGS_BEFORE_SHUTDOWN; };
 
 #ifdef ARCH_ESP32
     int beforeLightSleep(void *unused);
@@ -123,10 +130,16 @@ class Power : public concurrency::OSThread
     bool max17048Init();
     /// Setup a Lipo charger
     bool lipoChargerInit();
+    /// Retry a fuel gauge that did not come up during setup
+    void lipoChargerRetry();
     /// Setup a meshSolar battery sensor
     bool meshSolarInit();
     /// Setup a serial battery sensor
     bool serialBatteryInit();
+#ifdef HAS_ADS1115
+    /// Setup ADS1115 I2C battery level sensor
+    bool ads1115Init();
+#endif
 
   private:
     void shutdown();
@@ -134,6 +147,9 @@ class Power : public concurrency::OSThread
     // open circuit voltage lookup table
     uint8_t low_voltage_counter;
     uint32_t lastLogTime = 0;
+    // Periodic free-heap logging: time of the last line emitted, and the reading it carried
+    uint32_t lastHeapLogTime = 0;
+    uint32_t lastHeapLogFree = 0;
 
 #ifdef ARCH_ESP32
     // Get notified when lightsleep begins and ends

@@ -17,8 +17,7 @@ bool RoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, mesh
          config.device.rebroadcast_mode == meshtastic_Config_DeviceConfig_RebroadcastMode_KNOWN_ONLY)) {
         if (!maybePKI)
             return false;
-        if ((nodeDB->getMeshNode(mp.from) == NULL || !nodeDB->getMeshNode(mp.from)->has_user) &&
-            (nodeDB->getMeshNode(mp.to) == NULL || !nodeDB->getMeshNode(mp.to)->has_user))
+        if (!nodeInfoLiteHasUser(nodeDB->getMeshNode(mp.from)) && !nodeInfoLiteHasUser(nodeDB->getMeshNode(mp.to)))
             return false;
     } else if (owner.is_licensed && ((nodeDB->getLicenseStatus(mp.from) == UserLicenseStatus::NotLicensed) ||
                                      (nodeDB->getLicenseStatus(mp.to) == UserLicenseStatus::NotLicensed))) {
@@ -27,32 +26,28 @@ bool RoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, mesh
         LOG_DEBUG("Packet to or from unlicensed user, ignoring packet");
         return false;
     }
-    
-    // FIXME - move this to a non promsicious PhoneAPI module?
-    // Note: we are careful not to send back packets that started with the phone back to the phone
 
     printPacket("Routing sniffing", &mp);
     router->sniffReceived(&mp, r);
 
-    if (mp.which_payload_variant == meshtastic_MeshPacket_decoded_tag){
+    // fw+: per-port counters for OnDemand; packets without a decoded payload count under 511
+    if (mp.which_payload_variant == meshtastic_MeshPacket_decoded_tag) {
         meshtastic_PortNum port = mp.decoded.portnum;
         if (port >= 0 && port < MAX_PORTS) {
             ++portCounters[port];
         }
-    }else{
-            ++portCounters[511];
+    } else {
+        ++portCounters[511];
     }
 
-    const bool bcast = isBroadcast(mp.to);
-    const bool toUs = isToUs(&mp);
-    const bool fromUs = isFromUs(&mp);
-
-    if ((bcast || toUs) && (mp.from != 0)) {
+    // FIXME - move this to a non promsicious PhoneAPI module?
+    // Note: we are careful not to send back packets that started with the phone back to the phone
+    if ((isBroadcast(mp.to) || isToUs(&mp)) && (mp.from != 0)) {
         printPacket("Delivering rx packet", &mp);
         service->handleFromRadio(&mp);
     } else {
         // fw+ sniffer: forward transit (not to us, not local broadcast) once
-        if (moduleConfig.has_node_mod_admin && moduleConfig.node_mod_admin.sniffer_enabled && (mp.from != 0) && !fromUs) {
+        if (moduleConfig.has_node_mod_admin && moduleConfig.node_mod_admin.sniffer_enabled && (mp.from != 0) && !isFromUs(&mp)) {
             //fw+ guard pool exhaustion on sniffer copy
             meshtastic_MeshPacket *copyPtr = packetPool.allocCopy(mp);
             if (copyPtr) {
@@ -66,7 +61,6 @@ bool RoutingModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, mesh
     return false; // Let others look at this message also if they want
 }
 
-
 meshtastic_MeshPacket *RoutingModule::allocReply()
 {
     assert(currentRequest);
@@ -75,48 +69,53 @@ meshtastic_MeshPacket *RoutingModule::allocReply()
 }
 
 void RoutingModule::sendAckNak(meshtastic_Routing_Error err, NodeNum to, PacketId idFrom, ChannelIndex chIndex, uint8_t hopLimit,
-                               bool ackWantsAck)
+                               bool ackWantsAck, const meshtastic_MeshPacket *relaySource)
 {
-    auto p = allocAckNak(err, to, idFrom, chIndex, hopLimit);
+    auto p = allocAckNak(err, to, idFrom, chIndex, hopLimit, relaySource);
+    if (!p)
+        return;
+
     router->packetErrorCounters[static_cast<uint32_t>(err)]++;
-    if(moduleConfig.node_mod_admin.sniffer_enabled && moduleConfig.has_node_mod_admin){
+    if (moduleConfig.node_mod_admin.sniffer_enabled && moduleConfig.has_node_mod_admin) {
         //fw+ guard pool exhaustion on sniffer copy
         meshtastic_MeshPacket *copyPtr = packetPool.allocCopy(*p);
         if (copyPtr) {
             service->sendPacketToPhoneRaw(copyPtr);
         } else {
-            LOG_WARN("Skip sniffer copy in RoutingModule send: packetPool exhausted");
+            LOG_WARN("Skip sniffer copy of ACK in RoutingModule: packetPool exhausted");
         }
     }
 
     // Allow the caller to set want_ack on this ACK packet if it's important that the ACK be delivered reliably
     p->want_ack = ackWantsAck;
 
-    router->sendLocal(p); // we sometimes send directly to the local node
+    if (router->sendLocal(p) == ERRNO_SHOULD_RELEASE) // we sometimes send directly to the local node
+        packetPool.release(p);
 }
 
 uint8_t RoutingModule::getHopLimitForResponse(const meshtastic_MeshPacket &mp)
 {
     const int8_t hopsUsed = getHopsAway(mp);
+    const uint8_t responseHopLimit = Default::getConfiguredOrDefaultHopLimit(config.lora.hop_limit);
     if (hopsUsed >= 0) {
-        if (hopsUsed > (int32_t)(config.lora.hop_limit)) {
-// In event mode, we never want to send packets with more than our default 3 hops.
-#if !(EVENTMODE)             // This falls through to the default.
+        if (hopsUsed > static_cast<int32_t>(responseHopLimit)) {
+// In event mode, never exceed the configured event hop limit.
+#if !USERPREFS_EVENT_MODE    // This falls through to the default.
             return hopsUsed; // If the request used more hops than the limit, use the same amount of hops
 #endif
         } else if (mp.hop_start == 0) {
             return 0; // The requesting node wanted 0 hops, so the response also uses a direct/local path.
-        } else if ((uint8_t)(hopsUsed + 2) < config.lora.hop_limit) {
+        } else if (static_cast<uint8_t>(hopsUsed + 2) < responseHopLimit) {
             return hopsUsed + 2; // Use only the amount of hops needed with some margin as the way back may be different
         }
     }
-    return Default::getConfiguredOrDefaultHopLimit(config.lora.hop_limit); // Use the default hop limit
+    return responseHopLimit;
 }
 
 meshtastic_MeshPacket *RoutingModule::allocAckNak(meshtastic_Routing_Error err, NodeNum to, PacketId idFrom, ChannelIndex chIndex,
-                                                  uint8_t hopLimit)
+                                                  uint8_t hopLimit, const meshtastic_MeshPacket *relaySource)
 {
-    return MeshModule::allocAckNak(err, to, idFrom, chIndex, hopLimit);
+    return MeshModule::allocAckNak(err, to, idFrom, chIndex, hopLimit, relaySource);
 }
 
 RoutingModule::RoutingModule() : ProtobufModule("routing", meshtastic_PortNum_ROUTING_APP, &meshtastic_Routing_msg)

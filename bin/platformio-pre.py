@@ -7,10 +7,7 @@ platform = env.PioPlatform()
 if platform.name == "native":
     env.Replace(PROGNAME="meshtasticd")
 else:
-    from readprops import readProps, bumpHydraBuild
-    # hydra: one step up per real build (not for clean, monitor, IDE metadata etc.)
-    if not COMMAND_LINE_TARGETS or set(COMMAND_LINE_TARGETS) & {"buildprog", "upload"}:
-        print(f"Hydra build number: v{bumpHydraBuild(env['PROJECT_DIR'])}")
+    from readprops import readProps
     prefsLoc = env["PROJECT_DIR"] + "/version.properties"
     verObj = readProps(prefsLoc)
     env.Replace(PROGNAME=f"firmware-{env.get('PIOENV')}-{verObj['long']}")

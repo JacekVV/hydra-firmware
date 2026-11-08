@@ -35,11 +35,6 @@ class TransmitHistory
      */
     void setLastSentToMesh(uint16_t key);
 
-    /**
-     * hydra: forget the last broadcast for the key (memory and disk), so the next send is not throttled.
-     */
-    void forgetLastSentToMesh(uint16_t key);
-
 #ifdef PIO_UNIT_TESTING
     /**
      * Directly set the stored epoch for a key without touching the runtime lastMillis map.
@@ -83,7 +78,7 @@ class TransmitHistory
 
     /**
      * Wipe in-memory throttle state + remove the on-disk file. Required
-     * alongside rmDir("/prefs") in factoryReset — otherwise the 5-min
+     * alongside rmDir("/prefs") in factoryReset - otherwise the 5-min
      * auto-flush resurrects the file from the still-populated maps.
      */
     void clear();

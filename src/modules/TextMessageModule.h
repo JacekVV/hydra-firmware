@@ -7,8 +7,8 @@
  * Text message handling for Meshtastic.
  *
  * This module is responsible for receiving and storing incoming text messages
- * from the mesh. It updates device state and notifies observers so that other
- * components (such as the MessageRenderer) can later display or process them.
+ * from the mesh. It notifies observers so that other components (such as the
+ * MessageRenderer) can later display or process them.
  *
  * Rendering of messages on screen is no longer done here.
  */
@@ -19,7 +19,6 @@ class TextMessageModule : public SinglePortModule, public Observable<const mesht
      * name is for debugging output
      */
     TextMessageModule() : SinglePortModule("text", meshtastic_PortNum_TEXT_MESSAGE_APP) {}
-    
 
     bool recentlySeen(uint32_t id);
 
@@ -31,8 +30,6 @@ class TextMessageModule : public SinglePortModule, public Observable<const mesht
      */
     virtual ProcessMessage handleReceived(const meshtastic_MeshPacket &mp) override;
     virtual bool wantPacket(const meshtastic_MeshPacket *p) override;
-    //fw+ take packet by const reference; expose default targetId at declaration
-    virtual void sendTextMessage(const std::string &message, const meshtastic_MeshPacket &mp, uint32_t targetId = 0);
 
   private:
     uint32_t textPacketList[TEXT_PACKET_LIST_SIZE] = {0};

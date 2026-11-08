@@ -8,16 +8,18 @@
  * The RangeTestModule class is an OSThread that runs the module.
  * The RangeTestModuleRadio class handles sending and receiving packets.
  */
-#include "RangeTestModule.h"
+#include "configuration.h"
+#if !MESHTASTIC_EXCLUDE_RANGETEST && !MESHTASTIC_EXCLUDE_GPS
 #include "FSCommon.h"
 #include "MeshService.h"
 #include "NodeDB.h"
 #include "PowerFSM.h"
-#include "RTC.h"
+#include "RangeTestModule.h"
 #include "Router.h"
+#include "SPILock.h"
 #include "airtime.h"
-#include "configuration.h"
 #include "gps/GeoCoord.h"
+#include "gps/RTC.h"
 #include <Arduino.h>
 #include <Throttle.h>
 
@@ -48,36 +50,30 @@ int32_t RangeTestModule::runOnce()
     uint32_t senderHeartbeat = moduleConfig.range_test.sender * 1000;
     if (moduleConfig.range_test.enabled) {
 
-        if (firstTime)
-        {
+        if (firstTime) {
             rangeTestModuleRadio = new RangeTestModuleRadio();
 
             firstTime = 0;
 
             if (moduleConfig.range_test.clear_on_reboot) {
                 // User wants to delete previous range test(s)
-                LOG_INFO("Range Test Module - Clearing out previous test file");
+                LOG_INFO("Range Test Module - Clear previous test file");
                 rangeTestModuleRadio->removeFile();
             }
             if (moduleConfig.range_test.sender) {
                 LOG_INFO("Init Range Test Module -- Sender");
                 started = millis(); // make a note of when we started
                 return (5000);      // Sending first message 5 seconds after initialization.
-            }
-            else
-            {
+            } else {
                 LOG_INFO("Init Range Test Module -- Receiver");
                 return disable();
                 // This thread does not need to run as a receiver
             }
-        }
-        else
-        {
+        } else {
 
-            if (moduleConfig.range_test.sender)
-            {
+            if (moduleConfig.range_test.sender) {
                 // If sender
-                LOG_INFO("Range Test Module - Sending heartbeat every %d ms", (senderHeartbeat));
+                LOG_INFO("Range Test Module - Heartbeat every %d ms", (senderHeartbeat));
 
                 LOG_INFO("gpsStatus->getLatitude()     %d", gpsStatus->getLatitude());
                 LOG_INFO("gpsStatus->getLongitude()    %d", gpsStatus->getLongitude());
@@ -86,32 +82,24 @@ int32_t RangeTestModule::runOnce()
                 LOG_INFO("fixed_position()             %d", config.position.fixed_position);
 
                 // Only send packets if the channel is less than 25% utilized.
-                if (airTime->isTxAllowedChannelUtil(true))
-                {
+                if (airTime->isTxAllowedChannelUtil(true)) {
                     rangeTestModuleRadio->sendPayload();
                 }
 
                 // If we have been running for more than 8 hours, turn module back off
-                if (!Throttle::isWithinTimespanMs(started, 28800000))
-                {
+                if (!Throttle::isWithinTimespanMs(started, 28800000)) {
                     LOG_INFO("Range Test Module - Disable after 8 hours");
                     return disable();
-                }
-                else
-                {
+                } else {
                     return (senderHeartbeat);
                 }
-            }
-            else
-            {
+            } else {
                 return disable();
                 // This thread does not need to run as a receiver
             }
         }
-    }
-    else
-    {
-        LOG_INFO("Range Test Module - Disabled");
+    } else {
+        LOG_INFO("Range Test Module Disabled");
     }
 
 #endif
@@ -127,44 +115,20 @@ int32_t RangeTestModule::runOnce()
 void RangeTestModuleRadio::sendPayload(NodeNum dest, bool wantReplies)
 {
     meshtastic_MeshPacket *p = allocDataPacket();
-
-    p->from = nodeDB->getNodeNum();
-    // p->to = dest; //?? je videt ze FFFFF ale kde se to prirazuje, neni tu fallback?
-    p->to = NODENUM_BROADCAST; //?? je videt ze FFFFF ale kde se to prirazuje, neni tu fallback?
-    p->channel = channels.getByName("Private").index;
-    p->want_ack = false;
-    if (p->priority == meshtastic_MeshPacket_Priority_UNSET)
-    {
-        p->priority = meshtastic_MeshPacket_Priority_RELIABLE;
-    }
-
+    if (!p)
+        return;
+    p->to = dest;
     p->decoded.want_response = wantReplies;
-    p->hop_limit = config.lora.hop_limit;
+    p->hop_limit = 0;
+    p->want_ack = false;
 
     packetSequence++;
 
-    // Patch 2024-12-31
-    //float lat = static_cast<float>(gpsStatus->getLatitude() * 1e-7);
-    //float lon = static_cast<float>(gpsStatus->getLongitude() * 1e-7);
     static char heartbeatString[MAX_LORA_PAYLOAD_LEN + 1];
-    snprintf(heartbeatString, sizeof(heartbeatString), "seq %u https://www.google.com/maps/place/%.6f,%.6f",
-             packetSequence,
-             static_cast<float>(gpsStatus->getLatitude() * 1e-7),
-             static_cast<float>(gpsStatus->getLongitude() * 1e-7));
-    // Patch 2024-12-31
+    snprintf(heartbeatString, sizeof(heartbeatString), "seq %u", packetSequence);
 
     p->decoded.payload.size = strlen(heartbeatString); // You must specify how many bytes are in the reply
     memcpy(p->decoded.payload.bytes, heartbeatString, p->decoded.payload.size);
-
-    LOG_ERROR("RangeTestModule::sendPayload(): seq %u https://www.google.com/maps/place/%.6f,%.6f (%u)",
-              packetSequence,
-              static_cast<float>(gpsStatus->getLatitude() * 1e-7),
-              static_cast<float>(gpsStatus->getLongitude() * 1e-7),
-              p->channel);
-
-    //if (gpsStatus->getHasLock() == 1) {
-        //Send packet
-    //}
 
     service->sendToMesh(p);
 
@@ -176,12 +140,11 @@ ProcessMessage RangeTestModuleRadio::handleReceived(const meshtastic_MeshPacket 
 {
 #if defined(ARCH_ESP32) || defined(ARCH_NRF52) || defined(ARCH_STM32WL) || defined(ARCH_PORTDUINO)
 
-    if (moduleConfig.range_test.enabled)
-    {
+    if (moduleConfig.range_test.enabled) {
 
         /*
             auto &p = mp.decoded;
-            LOG_DEBUG("Received text msg self=0x%0x, from=0x%0x, to=0x%0x, id=%d, msg=%.*s",
+            LOG_DEBUG("Received text msg self=0x%08x, from=0x%08x, to=0x%08x, id=%d, msg=%.*s",
                   LOG_INFO.getNodeNum(), mp.from, mp.to, mp.id, p.payload.size, p.payload.bytes);
         */
 
@@ -194,7 +157,7 @@ ProcessMessage RangeTestModuleRadio::handleReceived(const meshtastic_MeshPacket 
             NodeInfoLite *n = nodeDB->getMeshNode(getFrom(&mp));
 
             LOG_DEBUG("-----------------------------------------");
-            LOG_DEBUG("p.payload.bytes  \"%s\"", p.payload.bytes);
+            LOG_DEBUG("p.payload.bytes  \"%.*s\"", (int)p.payload.size, p.payload.bytes);
             LOG_DEBUG("p.payload.size   %d", p.payload.size);
             LOG_DEBUG("---- Received Packet:");
             LOG_DEBUG("mp.from          %d", mp.from);
@@ -215,9 +178,7 @@ ProcessMessage RangeTestModuleRadio::handleReceived(const meshtastic_MeshPacket 
             LOG_DEBUG("-----------------------------------------");
             */
         }
-    }
-    else
-    {
+    } else {
         LOG_INFO("Range Test Module Disabled");
     }
 
@@ -234,7 +195,7 @@ bool RangeTestModuleRadio::appendFile(const meshtastic_MeshPacket &mp)
     meshtastic_NodeInfoLite *n = nodeDB->getMeshNode(getFrom(&mp));
     /*
         LOG_DEBUG("-----------------------------------------");
-        LOG_DEBUG("p.payload.bytes  \"%s\"", p.payload.bytes);
+        LOG_DEBUG("p.payload.bytes  \"%.*s\"", (int)p.payload.size, p.payload.bytes);
         LOG_DEBUG("p.payload.size   %d", p.payload.size);
         LOG_DEBUG("---- Received Packet:");
         LOG_DEBUG("mp.from          %d", mp.from);
@@ -253,39 +214,34 @@ bool RangeTestModuleRadio::appendFile(const meshtastic_MeshPacket &mp)
         LOG_DEBUG("gpsStatus->getDOP()          %d", gpsStatus->getDOP());
         LOG_DEBUG("-----------------------------------------");
     */
-    if (!FSBegin())
-    {
-        LOG_DEBUG("An Error has occurred while mounting the filesystem");
+    concurrency::LockGuard g(spiLock);
+    if (!FSBegin()) {
+        LOG_DEBUG("Filesystem mount error");
         return 0;
     }
 
-    if (FSCom.totalBytes() - FSCom.usedBytes() < 51200)
-    {
-        LOG_DEBUG("Filesystem doesn't have enough free space. Aborting write");
+    if (FSCom.totalBytes() - FSCom.usedBytes() < 51200) {
+        LOG_DEBUG("Filesystem low on free space. Abort write");
         return 0;
     }
 
     FSCom.mkdir("/static");
 
     // If the file doesn't exist, write the header.
-    if (!FSCom.exists("/static/rangetest.csv"))
-    {
+    if (!FSCom.exists("/static/rangetest.csv")) {
         //--------- Write to file
         File fileToWrite = FSCom.open("/static/rangetest.csv", FILE_WRITE);
 
-        if (!fileToWrite)
-        {
-            LOG_ERROR("There was an error opening the file for writing");
+        if (!fileToWrite) {
+            LOG_ERROR("Error opening file for writing");
             return 0;
         }
 
         // Print the CSV header
         if (fileToWrite.println("time,from,sender name,sender lat,sender long,rx lat,rx long,rx elevation,rx "
                                 "snr,distance,hop limit,payload,rx rssi")) {
-            LOG_INFO("File was written");
-        }
-        else
-        {
+            LOG_INFO("File written");
+        } else {
             LOG_ERROR("File write failed");
         }
         fileToWrite.flush();
@@ -295,15 +251,13 @@ bool RangeTestModuleRadio::appendFile(const meshtastic_MeshPacket &mp)
     //--------- Append content to file
     File fileToAppend = FSCom.open("/static/rangetest.csv", FILE_APPEND);
 
-    if (!fileToAppend)
-    {
-        LOG_ERROR("There was an error opening the file for appending");
+    if (!fileToAppend) {
+        LOG_ERROR("Error opening file for appending");
         return 0;
     }
 
     struct timeval tv;
-    if (!gettimeofday(&tv, NULL))
-    {
+    if (!gettimeofday(&tv, NULL)) {
         long hms = tv.tv_sec % SEC_PER_DAY;
         hms = (hms + SEC_PER_DAY) % SEC_PER_DAY;
 
@@ -313,57 +267,60 @@ bool RangeTestModuleRadio::appendFile(const meshtastic_MeshPacket &mp)
         int sec = (hms % SEC_PER_HOUR) % SEC_PER_MIN; // or hms % SEC_PER_MIN
 
         fileToAppend.printf("%02d:%02d:%02d,", hour, min, sec); // Time
-    }
-    else
-    {
+    } else {
         fileToAppend.printf("??:??:??,"); // Time
     }
 
-    fileToAppend.printf("%d,", getFrom(&mp));                   // From
-    fileToAppend.printf("%s,", n->user.long_name);              // Long Name
-    fileToAppend.printf("%f,", n->position.latitude_i * 1e-7);  // Sender Lat
-    fileToAppend.printf("%f,", n->position.longitude_i * 1e-7); // Sender Long
-    if (gpsStatus->getIsConnected() || config.position.fixed_position)
-    {
+    fileToAppend.printf("%d,", getFrom(&mp));          // From
+    fileToAppend.printf("%s,", n ? n->long_name : ""); // Long Name
+    meshtastic_PositionLite senderPos;
+    const bool haveSenderPos = nodeDB->copyNodePosition(getFrom(&mp), senderPos);
+    if (haveSenderPos) {
+        fileToAppend.printf("%f,", senderPos.latitude_i * 1e-7);  // Sender Lat
+        fileToAppend.printf("%f,", senderPos.longitude_i * 1e-7); // Sender Long
+    } else {
+        fileToAppend.printf("0.0,0.0,");
+    }
+    if (gpsStatus->getIsConnected() || config.position.fixed_position) {
         fileToAppend.printf("%f,", gpsStatus->getLatitude() * 1e-7);  // RX Lat
         fileToAppend.printf("%f,", gpsStatus->getLongitude() * 1e-7); // RX Long
         fileToAppend.printf("%d,", gpsStatus->getAltitude());         // RX Altitude
-    }
-    else
-    {
+    } else {
         // When the phone API is in use, the node info will be updated with position
-        meshtastic_NodeInfoLite *us = nodeDB->getMeshNode(nodeDB->getNodeNum());
-        fileToAppend.printf("%f,", us->position.latitude_i * 1e-7);  // RX Lat
-        fileToAppend.printf("%f,", us->position.longitude_i * 1e-7); // RX Long
-        fileToAppend.printf("%d,", us->position.altitude);           // RX Altitude
+        meshtastic_PositionLite usPos;
+        if (nodeDB->copyNodePosition(nodeDB->getNodeNum(), usPos)) {
+            fileToAppend.printf("%f,", usPos.latitude_i * 1e-7);  // RX Lat
+            fileToAppend.printf("%f,", usPos.longitude_i * 1e-7); // RX Long
+            fileToAppend.printf("%d,", usPos.altitude);           // RX Altitude
+        } else {
+            fileToAppend.printf("0.0,0.0,0,");
+        }
     }
 
     fileToAppend.printf("%f,", mp.rx_snr); // RX SNR
 
-    if (n->position.latitude_i && n->position.longitude_i && gpsStatus->getLatitude() && gpsStatus->getLongitude())
-    {
-        float distance = GeoCoord::latLongToMeter(n->position.latitude_i * 1e-7, n->position.longitude_i * 1e-7,
+    if (haveSenderPos && senderPos.latitude_i && senderPos.longitude_i && gpsStatus->getLatitude() && gpsStatus->getLongitude()) {
+        float distance = GeoCoord::latLongToMeter(senderPos.latitude_i * 1e-7, senderPos.longitude_i * 1e-7,
                                                   gpsStatus->getLatitude() * 1e-7, gpsStatus->getLongitude() * 1e-7);
         fileToAppend.printf("%f,", distance); // Distance in meters
-    }
-    else
-    {
+    } else {
         fileToAppend.printf("0,");
     }
 
     fileToAppend.printf("%d,", mp.hop_limit); // Packet Hop Limit
 
     // TODO: If quotes are found in the payload, it has to be escaped.
-    fileToAppend.printf("\"%s\"\n", p.payload.bytes);
-    fileToAppend.printf("%i,", mp.rx_rssi); // RX RSSI
+    fileToAppend.printf("\"%.*s\",", (int)p.payload.size, p.payload.bytes);
+    fileToAppend.printf("%i", mp.rx_rssi); // RX RSSI
 
+    fileToAppend.printf("\n");
     fileToAppend.flush();
     fileToAppend.close();
 
     return 1;
 
 #else
-    LOG_ERROR("Failed to store range test results - feature only available for ESP32");
+    LOG_ERROR("Can't store range test results - ESP32 only");
 
     return 0;
 #endif
@@ -373,28 +330,30 @@ bool RangeTestModuleRadio::removeFile()
 {
 #ifdef ARCH_ESP32
     if (!FSBegin()) {
-        LOG_DEBUG("An Error has occurred while mounting the filesystem");
+        LOG_DEBUG("Filesystem mount error");
         return 0;
     }
 
     if (!FSCom.exists("/static/rangetest.csv")) {
-        LOG_DEBUG("No range tests found.");
+        LOG_DEBUG("No range tests found");
         return 0;
     }
 
-    LOG_INFO("Deleting previous range test.");
+    LOG_INFO("Deleting previous range test");
     bool result = FSCom.remove("/static/rangetest.csv");
 
     if (!result) {
-        LOG_ERROR("Failed to delete range test.");
+        LOG_ERROR("Failed to delete range test");
         return 0;
     }
-    LOG_INFO("Range test removed.");
+    LOG_INFO("Range test removed");
 
     return 1;
 #else
-    LOG_ERROR("Failed to remove range test results - feature only available for ESP32");
+    LOG_ERROR("Can't remove range test results - ESP32 only");
 
     return 0;
 #endif
 }
+
+#endif // !MESHTASTIC_EXCLUDE_RANGETEST && !MESHTASTIC_EXCLUDE_GPS

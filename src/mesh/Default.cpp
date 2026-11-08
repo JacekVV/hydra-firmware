@@ -60,6 +60,26 @@ uint32_t Default::getConfiguredOrDefaultMsScaled(uint32_t configured, uint32_t d
     return base * coef;
 }
 
+uint32_t Default::getConfiguredOrDefaultMsScaled(uint32_t configured, uint32_t defaultValue, uint32_t numOnlineNodes,
+                                                 TrafficType type)
+{
+    uint32_t baseMs = getConfiguredOrDefaultMsScaled(configured, defaultValue, numOnlineNodes);
+
+    if (!myRegion || !myRegion->profile)
+        return baseMs;
+
+    int8_t throttle =
+        (type == TrafficType::POSITION) ? myRegion->profile->positionThrottle : myRegion->profile->telemetryThrottle;
+
+    // throttle <= 0 means unset; 1 is the neutral multiplier - skip the multiply for performance
+    if (throttle <= 1)
+        return baseMs;
+
+    constexpr uint32_t MAX_MS = static_cast<uint32_t>(INT32_MAX);
+    uint64_t result = static_cast<uint64_t>(baseMs) * static_cast<uint64_t>(throttle);
+    return result >= static_cast<uint64_t>(MAX_MS) ? MAX_MS : static_cast<uint32_t>(result);
+}
+
 uint32_t Default::getConfiguredOrMinimumValue(uint32_t configured, uint32_t minValue)
 {
     // If zero, intervals should be coalesced later by getConfiguredOrDefault... methods
@@ -72,35 +92,8 @@ uint32_t Default::getConfiguredOrMinimumValue(uint32_t configured, uint32_t minV
 uint8_t Default::getConfiguredOrDefaultHopLimit(uint8_t configured)
 {
 #if USERPREFS_EVENT_MODE
-    return (configured > HOP_RELIABLE) ? HOP_RELIABLE : config.lora.hop_limit;
+    return (configured >= eventModeHopLimit) ? eventModeHopLimit : config.lora.hop_limit;
 #else
     return (configured >= HOP_MAX) ? HOP_MAX : config.lora.hop_limit;
 #endif
-}
-
-uint32_t Default::getLightlyScaledWindowMs(uint32_t baseSeconds, uint32_t numOnlineNodes, bool includeJitter)
-{
-    // Light congestion-aware scaling for intra-telemetry spacing windows.
-    // Keeps behavior similar across roles but with smaller penalties than getConfiguredOrDefaultMsScaled.
-    float coeff = Default::congestionScalingCoefficientLight((int)numOnlineNodes);
-    uint32_t baseMs = baseSeconds * 1000;
-    uint32_t scaled = (uint32_t)(baseMs * coeff);
-
-    if (!includeJitter) return scaled;
-
-    // Add mild +/-10% jitter to reduce synchronization across nodes.
-    // random(min, max) is inclusive-exclusive on Arduino; guard if not available.
-    uint32_t jitterRange = scaled / 20; // 10%
-    uint32_t jitter = 0;
-    #ifdef ARDUINO
-    jitter = (uint32_t)random(0, (long)jitterRange);
-    #else
-    jitter = (uint32_t)(millis() % (jitterRange == 0 ? 1 : jitterRange));
-    #endif
-    bool subtract = ((millis() >> 2) & 0x1) != 0;
-    if (subtract) {
-        return (scaled > jitter) ? (scaled - jitter) : scaled;
-    } else {
-        return scaled + jitter;
-    }
 }

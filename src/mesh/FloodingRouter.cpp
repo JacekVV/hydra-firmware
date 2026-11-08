@@ -4,50 +4,42 @@
 #include "configuration.h"
 #include "mesh-pb-constants.h"
 #include "meshUtils.h"
+#include "gps/GeoCoord.h"
 #include "modules/TextMessageModule.h"
 #if !MESHTASTIC_EXCLUDE_TRACEROUTE
 #include "modules/TraceRouteModule.h"
 #endif
 
-#include "MeshService.h"
-#include "NodeDB.h"
-#include "gps/GeoCoord.h"
-
-//fw+ forward declare BroadcastAssist to avoid depending on module headers
-class BroadcastAssistModule;
-extern BroadcastAssistModule *broadcastAssistModule;
-
-FloodingRouter::FloodingRouter() {
-    // Initialize profile defaults (no designated initializers to keep C++11 compatible)
-    // Timings adjusted for MEDIUM_FAST preset (~200ms packet time)
-    
-    // SPARSE: Fast propagation (0.3-0.5 packet time), avoid CAD collision
+FloodingRouter::FloodingRouter()
+{
+    // fw+: profile defaults, timings for the MEDIUM_FAST preset (~200 ms packet time)
+    // SPARSE: fast propagation, avoid CAD collisions
     profileParamsSparse.base = 50;
     profileParamsSparse.hop = 20;
     profileParamsSparse.snrGain = 8;
     profileParamsSparse.jitter = 30;
     profileParamsSparse.backboneBias = 0;
 
-    // BALANCED: Moderate delay (0.6-0.9 packet time), general purpose
+    // BALANCED: moderate delay, general purpose
     profileParamsBalanced.base = 120;
     profileParamsBalanced.hop = 40;
     profileParamsBalanced.snrGain = 10;
     profileParamsBalanced.jitter = 60;
     profileParamsBalanced.backboneBias = 0;
 
-    // DENSE: Slower propagation (1.0-1.5 packet time), maximize cancel opportunities
+    // DENSE: slower propagation, maximize cancel opportunities
     profileParamsDense.base = 200;
     profileParamsDense.hop = 60;
     profileParamsDense.snrGain = 12;
     profileParamsDense.jitter = 100;
     profileParamsDense.backboneBias = 0;
 
-    // BACKBONE_BRIDGE: Similar to BALANCED but with bias for earlier transmission
+    // BACKBONE_BRIDGE: like BALANCED with an earlier transmission bias
     profileParamsBridge.base = 100;
     profileParamsBridge.hop = 40;
     profileParamsBridge.snrGain = 10;
     profileParamsBridge.jitter = 50;
-    profileParamsBridge.backboneBias = 30; // -30ms earlier for backbone priority
+    profileParamsBridge.backboneBias = 30;
 }
 
 /**
@@ -67,6 +59,9 @@ ErrorCode FloodingRouter::send(meshtastic_MeshPacket *p)
 
 bool FloodingRouter::shouldFilterReceived(const meshtastic_MeshPacket *p)
 {
+    if (!isToUs(p) && (p->hop_limit <= 0) && !isFromUs(p)) {
+        blocked_by_hoplimit++;
+    }
     bool wasUpgraded = false;
     bool seenRecently =
         wasSeenRecently(p, true, nullptr, nullptr, &wasUpgraded); // Updates history; returns false when an upgrade is detected
@@ -83,9 +78,6 @@ bool FloodingRouter::shouldFilterReceived(const meshtastic_MeshPacket *p)
     if (seenRecently) {
         printPacket("Ignore dupe incoming msg", p);
         rxDupe++;
-        //fw+ notify BroadcastAssist about upstream duplicate drops (by sender+id) without including module headers
-        extern void fwplus_ba_onOverheardFromId(uint32_t from, uint32_t id);
-        fwplus_ba_onOverheardFromId(getFrom(p), p->id);
 
         /* If the original transmitter is doing retransmissions (hopStart equals hopLimit) for a reliable transmission, e.g., when
         the ACK got lost, we will handle the packet again to make sure it gets an implicit ACK. */
@@ -94,8 +86,8 @@ bool FloodingRouter::shouldFilterReceived(const meshtastic_MeshPacket *p)
             LOG_DEBUG("Repeated reliable tx");
             // Check if it's still in the Tx queue, if not, we have to relay it again
             if (!findInTxQueue(p->from, p->id)) {
-                reprocessPacket(p);
-                perhapsRebroadcast(p);
+                if (reprocessPacket(p))
+                    perhapsRebroadcast(p);
             }
         } else {
             perhapsCancelDupe(p);
@@ -109,8 +101,19 @@ bool FloodingRouter::shouldFilterReceived(const meshtastic_MeshPacket *p)
 
 bool FloodingRouter::perhapsHandleUpgradedPacket(const meshtastic_MeshPacket *p)
 {
+    // We never relay our own packets: consume an upgraded copy with our number without touching the TX
+    // queue, rather than let it fall through to the dupe handling (perhapsCancelDupe) as well.
+    if (isFromUs(p))
+        return true;
+
     // isRebroadcaster() is duplicated in perhapsRebroadcast(), but this avoids confusing log messages
     if (isRebroadcaster() && iface && p->hop_limit > 0) {
+        // Verify the replacement before deleting the valid lower-hop copy waiting in the TX queue.
+        // This is intentionally redundant with ReliableRouter's ingress gate: it keeps this helper
+        // safe if another caller is introduced later.
+        if (passesRoutingAuthGate(const_cast<meshtastic_MeshPacket *>(p)) != RoutingAuthVerdict::ACCEPT)
+            return true;
+
         // If we overhear a duplicate copy of the packet with more hops left than the one we are waiting to
         // rebroadcast, then remove the packet currently sitting in the TX queue and use this one instead.
         uint8_t dropThreshold = p->hop_limit; // remove queued packets that have fewer hops remaining
@@ -118,7 +121,8 @@ bool FloodingRouter::perhapsHandleUpgradedPacket(const meshtastic_MeshPacket *p)
             LOG_DEBUG("Processing upgraded packet 0x%08x for rebroadcast with hop limit %d (dropping queued < %d)", p->id,
                       p->hop_limit, dropThreshold);
 
-            reprocessPacket(p);
+            if (!reprocessPacket(p))
+                return true;
             perhapsRebroadcast(p);
 
             rxDupe++;
@@ -130,32 +134,29 @@ bool FloodingRouter::perhapsHandleUpgradedPacket(const meshtastic_MeshPacket *p)
     return false;
 }
 
-void FloodingRouter::reprocessPacket(const meshtastic_MeshPacket *p)
+bool FloodingRouter::reprocessPacket(const meshtastic_MeshPacket *p)
 {
+    // Reprocessing a dupe is for relaying it; our own packets are never relayed, and their implicit ACK
+    // is generated in ReliableRouter::shouldFilterReceived before any dupe handling.
+    if (isFromUs(p))
+        return false;
+
+    if (p->which_payload_variant != meshtastic_MeshPacket_decoded_tag) {
+        auto decodedState = perhapsDecode(const_cast<meshtastic_MeshPacket *>(p));
+        if (decodedState != DecodeState::DECODE_SUCCESS && decodedState != DecodeState::DECODE_OPAQUE)
+            return false;
+    }
+
     if (nodeDB)
         nodeDB->updateFrom(*p);
 
 #if !MESHTASTIC_EXCLUDE_TRACEROUTE
-    if (traceRouteModule && p->which_payload_variant != meshtastic_MeshPacket_decoded_tag) {
-        // If we got a packet that is not decoded, try to decode it so we can check for traceroute.
-        auto decodedState = perhapsDecode(const_cast<meshtastic_MeshPacket *>(p));
-        if (decodedState == DecodeState::DECODE_SUCCESS) {
-            // parsing was successful, print for debugging
-            printPacket("reprocessPacket(DUP)", p);
-        } else {
-            // Fatal decoding error, we can't do anything with this packet
-            LOG_WARN(
-                "FloodingRouter::reprocessPacket: Fatal decode error (state=%d, id=0x%08x, from=%u), can't check for traceroute",
-                static_cast<int>(decodedState), p->id, getFrom(p));
-            return;
-        }
-    }
-
     if (traceRouteModule && p->which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
         p->decoded.portnum == meshtastic_PortNum_TRACEROUTE_APP) {
         traceRouteModule->processUpgradedPacket(*p);
     }
 #endif
+    return true;
 }
 
 bool FloodingRouter::roleAllowsCancelingDupe(const meshtastic_MeshPacket *p)
@@ -180,15 +181,16 @@ bool FloodingRouter::roleAllowsCancelingDupe(const meshtastic_MeshPacket *p)
 
 void FloodingRouter::perhapsCancelDupe(const meshtastic_MeshPacket *p)
 {
-    //fw+ prefer opportunistic cancel on first-hear; fall back to role-based cancel
-    bool allowCancel = (p->transport_mechanism == meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA);
-    if (allowCancel) {
+    // fw+: prefer opportunistic cancel on first hear; fall back to the role-based cancel
+    if (p->transport_mechanism == meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA) {
         if (isOpportunisticEnabled() && moduleConfig.node_mod_admin.opportunistic_cancel_on_first_hear) {
             if (Router::cancelSending(p->from, p->id)) {
                 txRelayCanceled++;
                 opportunistic_canceled++;
             }
         } else if (roleAllowsCancelingDupe(p)) {
+            // cancel rebroadcast of this message *if* there was already one, unless we're a router!
+            // But only LoRa packets should be able to trigger this.
             if (Router::cancelSending(p->from, p->id))
                 txRelayCanceled++;
         }
@@ -208,72 +210,6 @@ bool FloodingRouter::isRebroadcaster()
            config.device.rebroadcast_mode != meshtastic_Config_DeviceConfig_RebroadcastMode_NONE;
 }
 
-//fw+ perhapsRebroadcast with telemetry/position limiters and opportunistic flooding
-bool FloodingRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
-{
-    if (!isToUs(p) && (p->hop_limit <= 0) && !isFromUs(p)) {
-        blocked_by_hoplimit++;
-    }
-
-    if (!isToUs(p) && (p->hop_limit > 0) && !isFromUs(p)) {
-        if (p->id != 0) {
-            if (isRebroadcaster()) {
-                //fw+ Telemetry limiter: enforce per-minute limit
-                if (p->which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
-                    p->decoded.portnum == meshtastic_PortNum_TELEMETRY_APP) {
-                    if (!isTelemetryRebroadcastLimited(p)) {
-                        return false; // limit reached: do not rebroadcast telemetry
-                    }
-                }
-                //fw+ Position limiter: block unchanged position within threshold
-                if (p->which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
-                    p->decoded.portnum == meshtastic_PortNum_POSITION_APP) {
-                    if (!isPositionRebroadcastAllowed(p)) {
-                        return false; // too frequent unchanged position broadcast: do not rebroadcast
-                    }
-                }
-                meshtastic_MeshPacket *tosend = packetPool.allocCopy(*p); // keep a copy because we will be sending it
-                // Use shared logic to determine if hop_limit should be decremented
-                if (shouldDecrementHopLimit(p)) {
-                    tosend->hop_limit--; // bump down the hop count
-                } else {
-                    LOG_INFO("favorite-ROUTER/CLIENT_BASE-to-ROUTER/CLIENT_BASE flood: preserving hop_limit");
-                }
-#if USERPREFS_EVENT_MODE
-                if (tosend->hop_limit > 2) {
-                    // if we are "correcting" the hop_limit, "correct" the hop_start by the same amount to preserve hops away.
-                    tosend->hop_start -= (tosend->hop_limit - 2);
-                    tosend->hop_limit = 2;
-                }
-#endif
-
-                tosend->next_hop = NO_NEXT_HOP_PREFERENCE; // this should already be the case, but just in case
-
-                LOG_INFO("Rebroadcast received floodmsg");
-                // Note: we are careful to resend using the original senders node id
-                // We are careful not to call our hooked version of send() - because we don't want to check this again
-                //fw+ Opportunistic/selective flooding: schedule delayed rebroadcast, cancel on hear
-                if (isOpportunisticEnabled() && isBroadcast(tosend->to)) {
-                    uint32_t delayMs = computeOpportunisticDelayMs(p);
-                    if (delayMs > 0) {
-                        tosend->tx_after = millis() + delayMs;
-                    }
-                    opportunistic_scheduled++;
-                }
-
-                Router::send(tosend);
-                return true;
-            } else {
-                LOG_DEBUG("No rebroadcast: Role = CLIENT_MUTE or Rebroadcast Mode = NONE");
-            }
-        } else {
-            LOG_DEBUG("Ignore 0 id broadcast");
-        }
-    }
-    return false;
-}
-
-
 void FloodingRouter::sniffReceived(const meshtastic_MeshPacket *p, const meshtastic_Routing *c)
 {
     bool isAckorReply = (p->which_payload_variant == meshtastic_MeshPacket_decoded_tag) &&
@@ -289,64 +225,59 @@ void FloodingRouter::sniffReceived(const meshtastic_MeshPacket *p, const meshtas
     // handle the packet as normal
     Router::sniffReceived(p, c);
 
-    // Opportunistic profile: observe RX and maybe recompute every window //fw+
+    // fw+: observe RX and recompute the opportunistic profile once per window
     observeRxForProfile(p);
     maybeRecomputeProfile(millis());
 }
 
+// fw+: opportunistic flooding helpers
+
 void FloodingRouter::observeRxForProfile(const meshtastic_MeshPacket *p)
 {
-    // Initialize window if needed
     if (profileWindowStartMs == 0) {
         profileWindowStartMs = millis();
         lastRxDupeCounter = rxDupe;
         chanUtilEma = airTime->channelUtilizationPercent();
     }
 
-    // Track non-duplicate broadcast count in this window
-    if (isBroadcast(p->to)) {
-        // wasSeenRecently()  sniffReceived rcvd nonduplicates?
+    // non-duplicate broadcasts in this window
+    if (isBroadcast(p->to))
         windowBroadcastNonDup++;
-    }
 
-    // Smooth channel utilization
-    float util = airTime->channelUtilizationPercent();
+    // smooth channel utilization
     const float alpha = 0.2f;
-    chanUtilEma = (1.0f - alpha) * chanUtilEma + alpha * util;
+    chanUtilEma = (1.0f - alpha) * chanUtilEma + alpha * airTime->channelUtilizationPercent();
 }
 
 void FloodingRouter::maybeRecomputeProfile(uint32_t nowMs)
 {
-    if (profileWindowStartMs == 0) return;
-    if (nowMs - profileWindowStartMs < profileWindowMs) return;
+    if (profileWindowStartMs == 0)
+        return;
+    if (nowMs - profileWindowStartMs < profileWindowMs)
+        return;
 
-    // Compute window metrics
     uint32_t dupes = rxDupe - lastRxDupeCounter;
     float dupeRatio = 0.0f;
-    if (windowBroadcastNonDup > 0) {
+    if (windowBroadcastNonDup > 0)
         dupeRatio = (float)dupes / (float)windowBroadcastNonDup;
-    }
 
-    // Estimate neighbors 1-hop (non-MQTT)
+    // estimated 1-hop neighbors (not via MQTT)
     neighborsWin = 0;
-    size_t total = nodeDB->getNumMeshNodes();
+    const size_t total = nodeDB->getNumMeshNodes();
     for (size_t i = 0; i < total; ++i) {
         const meshtastic_NodeInfoLite *n = nodeDB->getMeshNodeByIndex(i);
-        if (!n) continue;
-        if (n->hops_away == 0 && !n->via_mqtt && n->num != nodeDB->getNodeNum()) neighborsWin++;
+        if (!n)
+            continue;
+        if (n->hops_away == 0 && !nodeInfoLiteViaMqtt(n) && n->num != nodeDB->getNodeNum())
+            neighborsWin++;
     }
 
-    // Select target profile with tuned thresholds; BACKBONE_BRIDGE overrides
-    // Adjusted for realistic network density classifications
     OpportunisticProfile newTarget = OpportunisticProfile::BALANCED;
-    bool hasBackbone = hasBackboneNeighbor();
-    if (hasBackbone) {
+    if (hasBackboneNeighbor()) {
         newTarget = OpportunisticProfile::BACKBONE_BRIDGE;
     } else if (neighborsWin <= 2 && dupeRatio < 0.10f && chanUtilEma < 15.0f) {
-        // SPARSE: <= 2 neighbors (was <= 1), relaxed thresholds for true sparse networks
         newTarget = OpportunisticProfile::SPARSE;
     } else if (neighborsWin >= 8 || dupeRatio >= 0.30f || chanUtilEma >= 40.0f) {
-        // DENSE: >= 8 neighbors (was >= 4), higher thresholds for genuinely dense networks
         newTarget = OpportunisticProfile::DENSE;
     }
 
@@ -357,11 +288,9 @@ void FloodingRouter::maybeRecomputeProfile(uint32_t nowMs)
         stableWindows = 0;
     }
 
-    if (stableWindows >= requiredStableWindows) {
+    if (stableWindows >= requiredStableWindows)
         currentProfile = targetProfile;
-    }
 
-    // Reset window
     profileWindowStartMs = nowMs;
     lastRxDupeCounter = rxDupe;
     windowBroadcastNonDup = 0;
@@ -370,15 +299,18 @@ void FloodingRouter::maybeRecomputeProfile(uint32_t nowMs)
 const FloodingRouter::ProfileParams &FloodingRouter::getParamsFor(OpportunisticProfile p) const
 {
     switch (p) {
-        case OpportunisticProfile::SPARSE: return profileParamsSparse;
-        case OpportunisticProfile::DENSE: return profileParamsDense;
-        case OpportunisticProfile::BACKBONE_BRIDGE: return profileParamsBridge;
-        case OpportunisticProfile::BALANCED:
-        default: return profileParamsBalanced;
+    case OpportunisticProfile::SPARSE:
+        return profileParamsSparse;
+    case OpportunisticProfile::DENSE:
+        return profileParamsDense;
+    case OpportunisticProfile::BACKBONE_BRIDGE:
+        return profileParamsBridge;
+    case OpportunisticProfile::BALANCED:
+    default:
+        return profileParamsBalanced;
     }
 }
 
-//fw+
 bool FloodingRouter::isOpportunisticEnabled() const
 {
     if (!moduleConfig.has_node_mod_admin)
@@ -389,237 +321,116 @@ bool FloodingRouter::isOpportunisticEnabled() const
 bool FloodingRouter::isOpportunisticAuto() const
 {
     if (!moduleConfig.has_node_mod_admin)
-        return true; // default to auto when section missing
+        return true;
     return moduleConfig.node_mod_admin.opportunistic_auto;
 }
 
-//fw+
 uint32_t FloodingRouter::clampDelay(uint32_t d) const
 {
-    // Adjusted for MEDIUM_FAST timing (~200ms packet time)
-    // D_MIN: Must be > CAD time (~15-20ms) to avoid collision
-    // D_MAX: ~2.5x packet time for worst-case dense network
+    // D_MIN must exceed the CAD time (~15-20 ms) to avoid collisions
+    // D_MAX is about 2.5x packet time for the worst-case dense network
     const uint32_t D_MIN = 25;
     const uint32_t D_MAX = 500;
-    if (d < D_MIN) return D_MIN;
-    if (d > D_MAX) return D_MAX;
+    if (d < D_MIN)
+        return D_MIN;
+    if (d > D_MAX)
+        return D_MAX;
     return d;
 }
 
-//fw+
 uint32_t FloodingRouter::computeOpportunisticDelayMs(const meshtastic_MeshPacket *p) const
 {
     if (!moduleConfig.has_node_mod_admin)
         return 0;
 
     const auto &adm = moduleConfig.node_mod_admin;
-    uint32_t base = adm.opportunistic_base_delay_ms;
-    uint32_t hop = adm.opportunistic_hop_delay_ms;
-    uint32_t snrGain = adm.opportunistic_snr_gain_ms;
-    uint32_t jitter = adm.opportunistic_jitter_ms;
+    const uint32_t base = adm.opportunistic_base_delay_ms;
+    const uint32_t hop = adm.opportunistic_hop_delay_ms;
+    const uint32_t snrGain = adm.opportunistic_snr_gain_ms;
+    const uint32_t jitter = adm.opportunistic_jitter_ms;
 
-    // if no parameters set, skip
     if (base == 0 && hop == 0 && snrGain == 0 && jitter == 0)
         return 0;
 
-     // compute used hops if hop_start is present
+    // hops already used, from hop_start and hop_limit
     int32_t usedHops = 0;
     if (p->hop_start > 0) {
         usedHops = (int32_t)p->hop_start - (int32_t)p->hop_limit;
-        if (usedHops < 0) usedHops = 0;
+        if (usedHops < 0)
+            usedHops = 0;
     }
 
-    // Clamp SNR into [0, 20] for scaling benefit only for positive SNR
+    // SNR scales the delay only when positive, clamped to [0, 20]
     float snr = p->rx_snr;
-    if (snr < 0) snr = 0;
-    if (snr > 20) snr = 20;
+    if (snr < 0)
+        snr = 0;
+    if (snr > 20)
+        snr = 20;
 
-    // Random jitter [0..jitter]?
-    uint32_t rj = jitter ? (random(jitter + 1)) : 0;
+    const uint32_t rj = jitter ? random(jitter + 1) : 0;
 
-    int32_t d = 0;
+    uint16_t pBase;
+    uint16_t pHop;
+    uint8_t pSnr;
+    int32_t backboneBias = 0;
     if (isOpportunisticAuto()) {
         const ProfileParams &pp = getParamsFor(currentProfile);
-        uint16_t pBase = pp.base;
-        uint16_t pHop = pp.hop;
-        uint8_t pSnr = pp.snrGain;
-        int32_t backboneBias = (int32_t)pp.backboneBias;
-        
-        // Overflow-safe calculation: compute components separately
-        int32_t hopDelay = (int32_t)(pHop * usedHops);
-        if (hopDelay > 5000) hopDelay = 5000; // clamp intermediate to prevent overflow
-        
-        int32_t snrReduction = (int32_t)(pSnr * (int32_t)snr);
-        if (snrReduction > 5000) snrReduction = 5000;
-        
-        d = (int32_t)pBase + hopDelay - snrReduction + (int32_t)rj - backboneBias;
+        pBase = pp.base;
+        pHop = pp.hop;
+        pSnr = pp.snrGain;
+        backboneBias = (int32_t)pp.backboneBias;
     } else {
-        // Manual override path (admin-config values)
-        uint16_t pBase = base ? base : 120;
-        uint16_t pHop = hop ? hop : 40;
-        uint8_t pSnr = snrGain ? (uint8_t)snrGain : 10;
-        
-        // Overflow-safe calculation
-        int32_t hopDelay = (int32_t)(pHop * usedHops);
-        if (hopDelay > 5000) hopDelay = 5000;
-        
-        int32_t snrReduction = (int32_t)(pSnr * (int32_t)snr);
-        if (snrReduction > 5000) snrReduction = 5000;
-        
-        d = (int32_t)pBase + hopDelay - snrReduction + (int32_t)rj;
+        // manual override from the admin config, with fallbacks for unset values
+        pBase = base ? base : 120;
+        pHop = hop ? hop : 40;
+        pSnr = snrGain ? (uint8_t)snrGain : 10;
     }
-    if (d <= 0) return (uint32_t)rj; // ensure non-negative, allow pure jitter
+
+    // overflow-safe: clamp each intermediate term
+    int32_t hopDelay = (int32_t)(pHop * usedHops);
+    if (hopDelay > 5000)
+        hopDelay = 5000;
+    int32_t snrReduction = (int32_t)(pSnr * (int32_t)snr);
+    if (snrReduction > 5000)
+        snrReduction = 5000;
+
+    int32_t d = (int32_t)pBase + hopDelay - snrReduction + (int32_t)rj - backboneBias;
+    if (d <= 0)
+        return (uint32_t)rj; // pure jitter, never negative
     return clampDelay((uint32_t)d);
 }
 
-//fw+
 bool FloodingRouter::hasBackboneNeighbor() const
 {
-    //heuristic: if we have a 1-hop neighbor with a large distance ==> treat it as backbone
-    //needs both positions: ours and neighbor’s, if missing  fail-open: false
+    // heuristic: a direct neighbor more than 10 km away means we are a backbone bridge.
+    // Needs both positions; without them fail open (false).
     const meshtastic_NodeInfoLite *self = nodeDB->getMeshNode(nodeDB->getNodeNum());
-    if (!self || !nodeDB->hasValidPosition(self)) return false;
+    if (!self || !nodeDB->hasValidPosition(self))
+        return false;
 
-    double selfLat = self->position.latitude_i * 1e-7;
-    double selfLon = self->position.longitude_i * 1e-7;
-
-    // distance threshold: 10 km (configurable in the future), backbone?
+    meshtastic_PositionLite selfPos;
+    if (!nodeDB->copyNodePosition(self->num, selfPos))
+        return false;
+    const double selfLat = selfPos.latitude_i * 1e-7;
+    const double selfLon = selfPos.longitude_i * 1e-7;
     const float thresholdMeters = 10000.0f;
 
-    size_t total = nodeDB->getNumMeshNodes();
+    const size_t total = nodeDB->getNumMeshNodes();
     for (size_t i = 0; i < total; ++i) {
         const meshtastic_NodeInfoLite *n = nodeDB->getMeshNodeByIndex(i);
-        if (!n || n->num == self->num) continue;
-        if (n->hops_away != 0 || n->via_mqtt) continue; //only direct neighbors
-        if (!nodeDB->hasValidPosition(n)) continue;
+        if (!n || n->num == self->num)
+            continue;
+        if (n->hops_away != 0 || nodeInfoLiteViaMqtt(n))
+            continue;
 
-        double nLat = n->position.latitude_i * 1e-7;
-        double nLon = n->position.longitude_i * 1e-7;
-        float dist = GeoCoord::latLongToMeter(selfLat, selfLon, nLat, nLon);
-        if (dist >= thresholdMeters) return true;
+        meshtastic_PositionLite nPos;
+        if (!nodeDB->copyNodePosition(n->num, nPos) || (nPos.latitude_i == 0 && nPos.longitude_i == 0))
+            continue;
+
+        const double nLat = nPos.latitude_i * 1e-7;
+        const double nLon = nPos.longitude_i * 1e-7;
+        if (GeoCoord::latLongToMeter(selfLat, selfLon, nLat, nLon) >= thresholdMeters)
+            return true;
     }
     return false;
-}
-bool FloodingRouter::isTelemetryRebroadcastLimited(const meshtastic_MeshPacket *p)
-{
-    // Read admin config from global moduleConfig
-    if (!moduleConfig.has_node_mod_admin) return true; // no admin module present, allow
-
-    const bool limiterEnabled = moduleConfig.node_mod_admin.telemetry_limiter_enabled;
-    const bool autoChanutilEnabled = moduleConfig.node_mod_admin.telemetry_limiter_auto_chanutil_enabled;
-    const uint16_t limitPerMinute = moduleConfig.node_mod_admin.telemetry_limiter_packets_per_minute;
-    const uint32_t chanUtilThreshold = moduleConfig.node_mod_admin.telemetry_limiter_auto_chanutil_threshold;
-
-    // Master switch off: allow all
-    if (!limiterEnabled) return true;
-
-    // If auto mode is enabled, enforce limiter only when channel utilization exceeds threshold
-    if (autoChanutilEnabled) {
-        float currentChanUtil = airTime->channelUtilizationPercent();
-        if (currentChanUtil < (float)chanUtilThreshold) {
-            return true; // below threshold: bypass limiter
-        }
-    }
-
-    // Enforce per-minute limiter
-    const uint32_t now = millis();
-    if (now - telemetryWindowStartMs >= 60000UL) {
-        telemetryWindowStartMs = now;
-        telemetryPacketsInWindow = 0;
-    }
-
-    if (telemetryPacketsInWindow >= limitPerMinute) {
-        LOG_DEBUG("Telemetry limiter: limit reached (%u/min)", limitPerMinute);
-        return false; // do not allow
-    }
-
-    // count only when we actually rebroadcast (we're about to)
-    telemetryPacketsInWindow++;
-    return true;
-}
-
-bool FloodingRouter::isPositionRebroadcastAllowed(const meshtastic_MeshPacket *p)
-{
-    if (!moduleConfig.has_node_mod_admin) return true;
-    if (!moduleConfig.node_mod_admin.position_limiter_enabled) return true;
-    if (p->which_payload_variant != meshtastic_MeshPacket_decoded_tag) return true;
-    if (p->decoded.portnum != meshtastic_PortNum_POSITION_APP) return true;
-    if (!isBroadcast(p->to) || isFromUs(p)) return true; // only throttle broadcast relays of others
-
-    meshtastic_Position pos = meshtastic_Position_init_default;
-    if (!pb_decode_from_bytes(p->decoded.payload.bytes, p->decoded.payload.size, &meshtastic_Position_msg, &pos)) {
-        return true; // if we can't decode, fail-open
-    }
-
-    // If position coordinates are not present (0,0) but that's uncommon; still apply logic directly
-    uint32_t thresholdMin = moduleConfig.node_mod_admin.position_limiter_time_minutes_threshold;
-    if (thresholdMin == 0) return true; // unset threshold means no throttling
-    uint32_t thresholdMs = thresholdMin * 60000UL;
-    uint32_t now = millis();
-
-    // Find existing entry
-    for (size_t i = 0; i < recentForwardedPositionsCount; ++i) {
-        if (recentForwardedPositions[i].nodeId == p->from) {
-            bool sameCoords = isSamePositionWithinTolerance(recentForwardedPositions[i], pos);
-            if (sameCoords && (now - recentForwardedPositions[i].lastRebroadcastMs) < thresholdMs) {
-                LOG_DEBUG("Position limiter: block node=%x delta<=%.1fm age=%ums threshold=%ums",
-                          p->from,
-                          kPositionRebroadcastToleranceMeters,
-                          now - recentForwardedPositions[i].lastRebroadcastMs,
-                          thresholdMs);
-                // Still within threshold with unchanged or near-unchanged position -> block
-                return false;
-            }
-            // Update LRU / values and allow
-            upsertPositionEntryLRU(p->from, pos.latitude_i, pos.longitude_i, now);
-            return true;
-        }
-    }
-
-    // No existing entry → add and allow
-    upsertPositionEntryLRU(p->from, pos.latitude_i, pos.longitude_i, now);
-    return true;
-}
-
-//fw+
-bool FloodingRouter::isSamePositionWithinTolerance(const ForwardedPositionEntry &entry, const meshtastic_Position &pos) const
-{
-    // Fast path for byte-identical coordinates before falling back to a meter-based tolerance.
-    if (entry.lastLat_i == pos.latitude_i && entry.lastLon_i == pos.longitude_i) return true;
-
-    float distMeters =
-        GeoCoord::latLongToMeter(entry.lastLat_i * 1e-7, entry.lastLon_i * 1e-7, pos.latitude_i * 1e-7, pos.longitude_i * 1e-7);
-    return distMeters <= kPositionRebroadcastToleranceMeters;
-}
-
-void FloodingRouter::upsertPositionEntryLRU(uint32_t nodeId, int32_t lat_i, int32_t lon_i, uint32_t nowMs)
-{
-    // Find existing index
-    size_t found = kMaxPositionEntries;
-    for (size_t i = 0; i < recentForwardedPositionsCount; ++i) {
-        if (recentForwardedPositions[i].nodeId == nodeId) { found = i; break; }
-    }
-
-    ForwardedPositionEntry entry;
-    entry.nodeId = nodeId;
-    entry.lastLat_i = lat_i;
-    entry.lastLon_i = lon_i;
-    entry.lastRebroadcastMs = nowMs;
-
-    if (found < kMaxPositionEntries) {
-        // Shift down to make room at front
-        for (size_t i = found; i > 0; --i) {
-            recentForwardedPositions[i] = recentForwardedPositions[i - 1];
-        }
-        recentForwardedPositions[0] = entry;
-    } else {
-        // Insert new at front
-        size_t limit = recentForwardedPositionsCount < kMaxPositionEntries ? recentForwardedPositionsCount : (kMaxPositionEntries - 1);
-        // Shift right up to limit
-        for (size_t i = limit; i > 0; --i) {
-            recentForwardedPositions[i] = recentForwardedPositions[i - 1];
-        }
-        recentForwardedPositions[0] = entry;
-        if (recentForwardedPositionsCount < kMaxPositionEntries) recentForwardedPositionsCount++;
-    }
 }

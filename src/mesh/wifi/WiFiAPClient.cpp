@@ -1,8 +1,9 @@
+#include "UptimeClock.h"
 #include "configuration.h"
 #if HAS_WIFI
 #include "NodeDB.h"
-#include "RTC.h"
 #include "concurrency/Periodic.h"
+#include "gps/RTC.h"
 #include "mesh/wifi/WiFiAPClient.h"
 
 #include "main.h"
@@ -10,9 +11,19 @@
 #include "target_specific.h"
 #include <WiFi.h>
 
-#if HAS_ETHERNET && defined(USE_WS5500)
-#include <ETHClass2.h>
-#define ETH ETH2
+#if HAS_ETHERNET && defined(ARCH_ESP32)
+#include <ETH.h>
+#include <SPI.h>
+#endif // HAS_ETHERNET
+
+#if HAS_ETHERNET && defined(ETH_SHARED_SPI)
+#include "platform/esp32/SharedBusEthernet.h"
+#endif
+
+#if HAS_ETHERNET && defined(USE_CH390D)
+#include "ESP32_CH390.h"
+#include "hal/spi_types.h"
+#define ETH CH390
 #endif // HAS_ETHERNET
 
 #include <WiFiUdp.h>
@@ -50,48 +61,126 @@ char ourHost[16];
 static unsigned long wifiReconnectStartMillis = 0;
 static bool wifiReconnectPending = false;
 
-// hydra: connection attempts since the last successful connection, drives the retry backoff
-static uint8_t wifiConnectAttempts = 0;
-
-// Delay before the next reconnect: 1s for the first two tries, then every 5s for about 1.5 minutes, then every 30s.
-// hydra v16: was up to 5 minutes, which kept a board offline for minutes after its AP came back (RPi reboot)
-// hydra v23: after a board dies without logging off (brownout, watchdog) the RPi access point keeps the dead association
-// for ~90 s and ignores new authentication (AUTH_EXPIRE); retrying every 5 s gets back on within seconds once it lets go
-static uint32_t wifiRetryDelayMs()
-{
-    if (wifiConnectAttempts < 2)
-        return 1000;
-    if (wifiConnectAttempts < 20)
-        return 5000;
-    return 30000;
-}
-
 bool APStartupComplete = 0;
 
 unsigned long lastrun_ntp = 0;
 
 bool needReconnect = true;   // If we create our reconnector, run it once at the beginning
 bool isReconnecting = false; // If we are currently reconnecting
+#if defined(USE_WS5500) || defined(USE_CH390D)
+static volatile bool ethNetworkConnectedPending = false;
+#endif
 
 WiFiUDP syslogClient;
 meshtastic::Syslog syslog(syslogClient);
 
 Periodic *wifiReconnect;
 
+#if defined(USE_WS5500) || defined(USE_CH390D)
+static void onNetworkConnected();
+static uint32_t lastEthIP = 0;
+static int32_t ethNetworkConnectedPoll()
+{
+    if (ethNetworkConnectedPending) {
+        ethNetworkConnectedPending = false;
+        uint32_t ip = (uint32_t)ETH.localIP();
+        bool ipChanged = APStartupComplete && ip != 0 && ip != lastEthIP;
+        onNetworkConnected();
+        if (ipChanged) {
+            LOG_INFO("Ethernet IP changed (%u.%u.%u.%u), restarting mDNS", ip & 0xff, (ip >> 8) & 0xff, (ip >> 16) & 0xff,
+                     (ip >> 24) & 0xff);
+            MDNS.end();
+            if (MDNS.begin("Meshtastic")) {
+                MDNS.addService("meshtastic", "tcp", SERVER_API_DEFAULT_PORT);
+                MDNS.addServiceTxt("meshtastic", "tcp", "shortname", String(owner.short_name));
+                MDNS.addServiceTxt("meshtastic", "tcp", "id", String(nodeDB->getNodeId().c_str()));
+                MDNS.addServiceTxt("meshtastic", "tcp", "pio_env", optstr(APP_ENV));
+            }
+        }
+        if (ip != 0)
+            lastEthIP = ip;
+    }
+    return 500;
+}
+#endif
+
+#if defined(USE_WS5500) || defined(USE_CH390D)
+// Needs the netif, so only valid after ETH.begin(). Failures fall back to DHCP
+static void applyEthStaticIp()
+{
+    if (config.network.address_mode != meshtastic_Config_NetworkConfig_AddressMode_STATIC)
+        return;
+
+    if (config.network.ipv4_config.ip == 0)
+        LOG_WARN("Static address mode but no IP configured, using DHCP");
+    else if (!ETH.config(config.network.ipv4_config.ip, config.network.ipv4_config.gateway, config.network.ipv4_config.subnet,
+                         config.network.ipv4_config.dns))
+        LOG_ERROR("Failed to apply static IP to Ethernet, using DHCP");
+}
+#endif
+
 #ifdef USE_WS5500
 // Startup Ethernet
 bool initEthernet()
 {
-    if ((config.network.eth_enabled) && (ETH.begin(ETH_PHY_W5500, 1, ETH_CS_PIN, ETH_INT_PIN, ETH_RST_PIN, SPI3_HOST,
-                                                   ETH_SCLK_PIN, ETH_MISO_PIN, ETH_MOSI_PIN))) {
-        WiFi.onEvent(WiFiEvent);
-#if !MESHTASTIC_EXCLUDE_WEBSERVER
-        createSSLCert(); // For WebServer
-#endif
-        return true;
-    }
+    if (!config.network.eth_enabled)
+        return false;
 
-    return false;
+    // Register before begin(): static config can fire ETH_GOT_IP immediately
+    WiFi.onEvent(WiFiEvent);
+
+#ifdef ETH_SHARED_SPI
+    // SharedBusEthernet takes spiLock around every W5500 transfer; Arduino's ETH cannot.
+    if (!ETH.begin())
+        return false;
+#else
+    if (!ETH.begin(ETH_PHY_W5500, 1, ETH_CS_PIN, ETH_INT_PIN, ETH_RST_PIN, SPI3_HOST, ETH_SCLK_PIN, ETH_MISO_PIN, ETH_MOSI_PIN))
+        return false;
+#endif
+
+    applyEthStaticIp();
+#if !MESHTASTIC_EXCLUDE_WEBSERVER
+    createSSLCert(); // For WebServer
+#endif
+    new concurrency::Periodic("EthConnect", ethNetworkConnectedPoll);
+    return true;
+}
+#endif
+
+#ifdef USE_CH390D
+// Startup Ethernet
+bool initEthernet()
+{
+    if (!config.network.eth_enabled)
+        return false;
+
+    // Configure CH390
+    ch390_config_t ch390_conf = CH390_DEFAULT_CONFIG();
+    ch390_conf.spi_host = SPI3_HOST;
+    ch390_conf.spi_cs_gpio = ETH_CS_PIN;
+    ch390_conf.spi_sck_gpio = ETH_SCLK_PIN;
+    ch390_conf.spi_mosi_gpio = ETH_MOSI_PIN;
+    ch390_conf.spi_miso_gpio = ETH_MISO_PIN;
+    ch390_conf.int_gpio = ETH_INT_PIN;
+#ifdef ETH_RST_PIN
+    ch390_conf.reset_gpio = ETH_RST_PIN;
+#else
+    ch390_conf.reset_gpio = -1;
+#endif
+    ch390_conf.spi_clock_mhz = 20;
+
+    // Register before begin(): static config can fire ETH_GOT_IP immediately
+    WiFi.onEvent(WiFiEvent);
+
+    if (!ETH.begin(ch390_conf))
+        return false;
+
+    applyEthStaticIp();
+#if !MESHTASTIC_EXCLUDE_WEBSERVER
+    createSSLCert(); // For WebServer
+#endif
+    new concurrency::Periodic("EthConnect", ethNetworkConnectedPoll);
+    return true;
 }
 #endif
 
@@ -103,7 +192,7 @@ static void onNetworkConnected()
 
         // start mdns
         if (!MDNS.begin("Meshtastic")) {
-            LOG_ERROR("Error setting up mDNS responder!");
+            LOG_ERROR("mDNS setup failed");
         } else {
             LOG_INFO("mDNS Host: Meshtastic.local");
             MDNS.addService("meshtastic", "tcp", SERVER_API_DEFAULT_PORT);
@@ -140,7 +229,19 @@ static void onNetworkConnected()
                 serverPort = port.toInt();
                 serverAddr = server.c_str();
             }
-            syslog.server(serverAddr, serverPort);
+            if (strcmp(serverAddr, "broadcast") == 0) {
+                // fw+: subnet broadcast from this board's own DHCP address and mask, so the log server
+                // follows the LAN without a fixed IP in the config (rsyslog_server = "broadcast:5140").
+                IPAddress ip = WiFi.localIP();
+                IPAddress mask = WiFi.subnetMask();
+                IPAddress bcast;
+                for (int i = 0; i < 4; i++)
+                    bcast[i] = ip[i] | ~mask[i];
+                LOG_INFO("Syslog to subnet broadcast %s", bcast.toString().c_str());
+                syslog.server(bcast, serverPort);
+            } else {
+                syslog.server(serverAddr, serverPort);
+            }
             syslog.deviceHostname(getDeviceName());
             syslog.appName("Meshtastic");
             syslog.defaultPriority(LOGLEVEL_USER);
@@ -165,6 +266,22 @@ static void onNetworkConnected()
         udpHandler->start();
     }
 #endif
+}
+
+// hydra: connection attempts since the last successful connection, drives the retry backoff
+static uint8_t wifiConnectAttempts = 0;
+
+// Delay before the next reconnect: 1s for the first two tries, then every 5s for about 1.5 minutes, then every 30s.
+// hydra v16: was up to 5 minutes, which kept a board offline for minutes after its AP came back (RPi reboot)
+// hydra v23: after a board dies without logging off (brownout, watchdog) the RPi access point keeps the dead association
+// for ~90 s and ignores new authentication (AUTH_EXPIRE); retrying every 5 s gets back on within seconds once it lets go
+static uint32_t wifiRetryDelayMs()
+{
+    if (wifiConnectAttempts < 2)
+        return 1000;
+    if (wifiConnectAttempts < 20)
+        return 5000;
+    return 30000;
 }
 
 static int32_t reconnectWiFi()
@@ -207,6 +324,27 @@ static int32_t reconnectWiFi()
                 if (wifiConnectAttempts < UINT8_MAX)
                     wifiConnectAttempts++;
                 WiFi.begin(wifiName, wifiPsw);
+#if defined(ARCH_ESP32)
+                // hydra: moc nadawania Wi-Fi z config.lora.wifi_power (dBm, zakres 2..21; 0 = domyślna z HYDRA_WIFI_TX_POWER_QDBM).
+                // ESP-IDF przyjmuje jednostkę 0,25 dBm (8..84).
+                {
+                    int dbm = config.lora.wifi_power;
+#if defined(HYDRA_WIFI_TX_POWER_QDBM)
+                    int qdbm = HYDRA_WIFI_TX_POWER_QDBM;
+#else
+                    int qdbm = 0;
+#endif
+                    if (dbm != 0) {
+                        if (dbm < 2)
+                            dbm = 2;
+                        if (dbm > 21)
+                            dbm = 21;
+                        qdbm = dbm * 4;
+                    }
+                    if (qdbm)
+                        esp_wifi_set_max_tx_power(qdbm);
+                }
+#endif
             }
             isReconnecting = false;
             wifiReconnectPending = false;
@@ -219,15 +357,15 @@ static int32_t reconnectWiFi()
 #ifndef DISABLE_NTP
     if (WiFi.isConnected() && (!Throttle::isWithinTimespanMs(lastrun_ntp, 43200000) || (lastrun_ntp == 0))) { // every 12 hours
         LOG_DEBUG("Update NTP time from %s", config.network.ntp_server);
-        if (timeClient.update()) {
-            LOG_DEBUG("NTP Request Success - Setting RTCQualityNTP if needed");
+        if (timeClient.forceUpdate()) {
+            LOG_DEBUG("NTP success - set RTCQualityNTP if needed");
 
             struct timeval tv;
             tv.tv_sec = timeClient.getEpochTime();
             tv.tv_usec = 0;
 
             perhapsSetRTC(RTCQualityNTP, &tv);
-            lastrun_ntp = millis();
+            lastrun_ntp = Time::skipZero(Time::getMillis());
         } else {
             LOG_DEBUG("NTP Update failed");
         }
@@ -240,8 +378,10 @@ static int32_t reconnectWiFi()
 #endif
         return 1000; // check once per second
     } else {
-#ifdef ARCH_RP2040
-        onNetworkConnected(); // will only do anything once
+        onNetworkConnected(); // will only do anything once (guarded by APStartupComplete)
+#ifndef DISABLE_NTP
+        if (lastrun_ntp == 0)
+            return 5000; // NTP not yet synced, retry sooner
 #endif
         return 300000; // every 5 minutes
     }
@@ -252,7 +392,7 @@ bool isWifiAvailable()
 
     if (config.network.wifi_enabled && (config.network.wifi_ssid[0])) {
         return true;
-#ifdef USE_WS5500
+#if defined(USE_WS5500) || defined(USE_CH390D)
     } else if (config.network.eth_enabled) {
         return true;
 #endif
@@ -292,9 +432,6 @@ bool initWifi()
         const char *wifiPsw = config.network.wifi_psk;
 
 #ifndef ARCH_RP2040
-#if !MESHTASTIC_EXCLUDE_WEBSERVER
-        createSSLCert(); // For WebServer
-#endif
         WiFi.persistent(false); // Disable flash storage for WiFi credentials
 #endif
         if (!*wifiPsw) // Treat empty password as no password
@@ -319,6 +456,9 @@ bool initWifi()
 #endif
             }
 #ifdef ARCH_ESP32
+            // Register WiFi event handler BEFORE createSSLCert() to prevent race condition:
+            // Without this, WiFi can auto-reconnect during cert generation and fire GOT_IP
+            // before the handler is registered, causing onNetworkConnected() to never run.
             WiFi.onEvent(WiFiEvent);
             // hydra: reconnects are handled only by reconnectWiFi(); the Arduino auto-reconnect ran in parallel with it
             WiFi.setAutoReconnect(false);
@@ -341,6 +481,12 @@ bool initWifi()
                     wifiDisconnectReason = info.wifi_sta_disconnected.reason;
                 },
                 WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+#endif
+
+#ifndef ARCH_RP2040
+#if !MESHTASTIC_EXCLUDE_WEBSERVER
+            createSSLCert(); // For WebServer - called after WiFi.onEvent() to avoid race condition
+#endif
 #endif
             LOG_DEBUG("JOINING WIFI soon: ssid=%s", wifiName);
             wifiReconnect = new Periodic("WifiConnect", reconnectWiFi);
@@ -403,13 +549,13 @@ static void WiFiEvent(WiFiEvent_t event)
 #endif
         }
 #ifdef WIFI_LED
-        digitalWrite(WIFI_LED, HIGH);
+        digitalWrite(WIFI_LED, LOW ^ WIFI_STATE_ON);
 #endif
         break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
         LOG_INFO("Disconnected from WiFi access point");
 #ifdef WIFI_LED
-        digitalWrite(WIFI_LED, LOW);
+        digitalWrite(WIFI_LED, HIGH ^ WIFI_STATE_ON);
 #endif
 #if HAS_UDP_MULTICAST
         if (udpHandler) {
@@ -426,7 +572,7 @@ static void WiFiEvent(WiFiEvent_t event)
         }
         break;
     case ARDUINO_EVENT_WIFI_STA_AUTHMODE_CHANGE:
-        LOG_INFO("Authentication mode of access point has changed");
+        LOG_INFO("AP auth mode changed");
         break;
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
         LOG_INFO("Obtained IP address: %s", WiFi.localIP().toString().c_str());
@@ -443,7 +589,7 @@ static void WiFiEvent(WiFiEvent_t event)
 #endif
         break;
     case ARDUINO_EVENT_WIFI_STA_LOST_IP:
-        LOG_INFO("Lost IP address and IP address is reset to 0");
+        LOG_INFO("Lost IP address, reset to 0");
 #if HAS_UDP_MULTICAST
         if (udpHandler) {
             udpHandler->stop();
@@ -457,30 +603,30 @@ static void WiFiEvent(WiFiEvent_t event)
         }
         break;
     case ARDUINO_EVENT_WPS_ER_SUCCESS:
-        LOG_INFO("WiFi Protected Setup (WPS): succeeded in enrollee mode");
+        LOG_INFO("WPS: succeeded in enrollee mode");
         break;
     case ARDUINO_EVENT_WPS_ER_FAILED:
-        LOG_INFO("WiFi Protected Setup (WPS): failed in enrollee mode");
+        LOG_INFO("WPS: failed in enrollee mode");
         break;
     case ARDUINO_EVENT_WPS_ER_TIMEOUT:
-        LOG_INFO("WiFi Protected Setup (WPS): timeout in enrollee mode");
+        LOG_INFO("WPS: timeout in enrollee mode");
         break;
     case ARDUINO_EVENT_WPS_ER_PIN:
-        LOG_INFO("WiFi Protected Setup (WPS): pin code in enrollee mode");
+        LOG_INFO("WPS: pin code in enrollee mode");
         break;
     case ARDUINO_EVENT_WPS_ER_PBC_OVERLAP:
-        LOG_INFO("WiFi Protected Setup (WPS): push button overlap in enrollee mode");
+        LOG_INFO("WPS: push button overlap in enrollee mode");
         break;
     case ARDUINO_EVENT_WIFI_AP_START:
         LOG_INFO("WiFi access point started");
 #ifdef WIFI_LED
-        digitalWrite(WIFI_LED, HIGH);
+        digitalWrite(WIFI_LED, LOW ^ WIFI_STATE_ON);
 #endif
         break;
     case ARDUINO_EVENT_WIFI_AP_STOP:
         LOG_INFO("WiFi access point stopped");
 #ifdef WIFI_LED
-        digitalWrite(WIFI_LED, LOW);
+        digitalWrite(WIFI_LED, HIGH ^ WIFI_STATE_ON);
 #endif
         break;
     case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
@@ -513,17 +659,25 @@ static void WiFiEvent(WiFiEvent_t event)
         break;
     case ARDUINO_EVENT_ETH_DISCONNECTED:
         syslog.disable();
+#if HAS_UDP_MULTICAST
+        if (udpHandler) {
+            udpHandler->stop();
+        }
+#endif
         LOG_INFO("Ethernet disconnected");
         break;
     case ARDUINO_EVENT_ETH_GOT_IP:
-#ifdef USE_WS5500
+#if defined(USE_WS5500) || defined(USE_CH390D)
         LOG_INFO("Obtained IP address: %s, %u Mbps, %s", ETH.localIP().toString().c_str(), ETH.linkSpeed(),
                  ETH.fullDuplex() ? "FULL_DUPLEX" : "HALF_DUPLEX");
-        onNetworkConnected();
+        ethNetworkConnectedPending = true;
 #endif
         break;
     case ARDUINO_EVENT_ETH_GOT_IP6:
-#ifdef USE_WS5500
+#if defined(USE_CH390D)
+        // The CH390 driver's ETH class doesn't expose the IPv6 address getters
+        LOG_INFO("Obtained IP6 address");
+#elif defined(USE_WS5500)
 #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
         LOG_INFO("Obtained Local IP6 address: %s", ETH.linkLocalIPv6().toString().c_str());
         LOG_INFO("Obtained GlobalIP6 address: %s", ETH.globalIPv6().toString().c_str());

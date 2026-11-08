@@ -42,8 +42,6 @@ class OnDemandModule : private concurrency::OSThread, public ProtobufModule<mesh
     bool fitsInPacket(const meshtastic_OnDemand &onDemand, size_t maxSize);
     std::vector<std::unique_ptr<meshtastic_OnDemand>> createSegmentedNodeList(bool directOnly = false);
     std::vector<std::unique_ptr<meshtastic_OnDemand>> createSegmentedRoutingTable();
-    meshtastic_OnDemand prepareNodeList(uint32_t packetIndex);
-    static uint32_t getLastHeard(const meshtastic_NodeInfoLite* node);
     uint32_t sinceLastSeen(const meshtastic_NodeInfoLite *n);
     meshtastic_OnDemand preparePingResponse(const meshtastic_MeshPacket &mp);
     meshtastic_OnDemand prepareRxAvgTimeHistory();
@@ -54,10 +52,6 @@ class OnDemandModule : private concurrency::OSThread, public ProtobufModule<mesh
     meshtastic_OnDemand prepareFwPlusVersion();
     meshtastic_OnDemand prepareRoutingErrorResponse();
     meshtastic_OnDemand preparePingResponseAck(const meshtastic_MeshPacket &mp);
-    //fw+ S&F status
-    meshtastic_OnDemand prepareSFCustodyStatus();
-    //fw+ DTN overlay stats
-    meshtastic_OnDemand prepareDtnOverlayStats();
     //fw+ Broadcast Assist stats
     meshtastic_OnDemand prepareBroadcastAssistStats();
 

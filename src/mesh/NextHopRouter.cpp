@@ -1,8 +1,8 @@
 #include "NextHopRouter.h"
-#include "MeshService.h"
-#include <pb.h>
-#include <pb_decode.h>
+#include "Default.h"
 #include "MeshTypes.h"
+#include "Throttle.h"
+#include "UptimeClock.h"
 #include "meshUtils.h"
 #if !MESHTASTIC_EXCLUDE_TRACEROUTE
 #include "modules/TraceRouteModule.h"
@@ -11,309 +11,95 @@
 #include "modules/TrafficManagementModule.h"
 #endif
 #include "NodeDB.h"
-#include "MobilityOracle.h" //fw+
 
-//fw+ forward declare BroadcastAssist to avoid depending on module headers
-class BroadcastAssistModule;
-extern BroadcastAssistModule *broadcastAssistModule;
+#if USERPREFS_EVENT_MODE
+static void capEventRelayHops(meshtastic_MeshPacket *packet)
+{
+    if (packet->hop_limit <= Default::eventModeRelayHopLimit)
+        return;
+
+    const uint8_t reduction = packet->hop_limit - Default::eventModeRelayHopLimit;
+    packet->hop_start = reduction <= packet->hop_start ? packet->hop_start - reduction : 0;
+    packet->hop_limit = Default::eventModeRelayHopLimit;
+}
+#endif
 
 NextHopRouter::NextHopRouter() {}
-//fw++
-// Purpose: DV-ETX route learning from traceroute paths
-// Supports both ACTIVE learning (we're in path) and PASSIVE learning (we relay foreign traceroute)
-// This enables faster routing table buildup in large networks (100-200 nodes)
-void NextHopRouter::processPathAndLearn(const uint32_t *path, size_t maxHops,
-                                        const int8_t *snrList, size_t maxSnr,
-                                        const meshtastic_MeshPacket *p)
-{
-    if (!path || maxHops < 2) {
-        LOG_DEBUG("NextHop: processPathAndLearn guard: path=%p maxHops=%u", path, (unsigned)maxHops);
-        return;
-    }
-    uint32_t selfNum = getNodeNum();
-    int selfIdx = -1;
-    for (size_t i = 0; i < maxHops; ++i) {
-        if (path[i] == selfNum) { selfIdx = (int)i; break; }
-    }
-    
-    // ═══════════════════════════════════════════════════════════════════
-    // DV-ETX ACTIVE LEARNING: We are in path (high confidence)
-    // ═══════════════════════════════════════════════════════════════════
-    if (selfIdx >= 0 && (selfIdx + 1) < (int)maxHops) {
-        uint32_t dest = path[maxHops - 1];
-        uint8_t nextHop = (uint8_t)(path[selfIdx + 1] & 0xFF);
 
-        // Gate on direct neighbor presence for the candidate last byte
-        if (!isDirectNeighborLastByte(nextHop)) {
-            LOG_DEBUG("NextHop: Skip ACTIVE learn: nextHop 0x%x is not a direct neighbor", nextHop);
-            return;  // Can't learn if next hop isn't our direct neighbor
-        }
-
-        float linkEtx = 2.0f;
-        if (snrList && maxSnr > (size_t)selfIdx) {
-            float snr = (float)snrList[selfIdx] / 4.0f;
-            linkEtx = estimateEtxFromSnr(snr);
-        } else if (p) {
-            linkEtx = estimateEtxFromSnr(p->rx_snr);
-        } else {
-            linkEtx = 1.5f; // Default conservative ETX when no SNR data available (DTN custody chains)
-        }
-        int remainingHops = (int)maxHops - selfIdx - 1;
-        float observedCost = linkEtx + (remainingHops > 1 ? (remainingHops - 1) * 1.0f : 0.0f);
-        learnRoute(dest, nextHop, observedCost);
-        LOG_INFO("NextHop: ACTIVE LEARN dest=0x%x via=0x%x cost=%.1f SNR=%.1f pathlen=%u pos=%d [IN-PATH TRACEROUTE]", 
-                 dest, nextHop, observedCost, linkEtx, (unsigned)maxHops, selfIdx);
-    }
-    // ═══════════════════════════════════════════════════════════════════
-    // DV-ETX PASSIVE LEARNING: We relay foreign traceroute (opportunistic)
-    // ═══════════════════════════════════════════════════════════════════
-    // If we're NOT in path but relaying this traceroute, we can infer:
-    // "destination is reachable via the neighbor who sent us this traceroute"
-    // This dramatically speeds up route discovery in large networks (100-200 nodes)
-    else if (selfIdx < 0 && maxHops >= 2) {
-        //fw+ CRITICAL: Check if p is not nullptr before accessing (DTN custody chains pass nullptr)
-        if (!p) {
-            LOG_DEBUG("NextHop: Skip PASSIVE learn: no packet context (DTN custody chain, need packet for receivedFrom)");
-            return;
-        }
-        
-        uint32_t dest = path[maxHops - 1];  // Final destination
-        uint32_t receivedFrom = getFrom(p);  // Who sent us this packet
-        uint8_t viaHop = (uint8_t)(receivedFrom & 0xFF);
-        
-        LOG_DEBUG("NextHop: PASSIVE candidate: dest=0x%x via=0x%x (from=0x%x) selfIdx=%d", 
-                  dest, viaHop, receivedFrom, selfIdx);
-        
-        // Only learn if receivedFrom is our direct neighbor
-        if (!isDirectNeighborLastByte(viaHop)) {
-            LOG_DEBUG("NextHop: Skip PASSIVE learn: viaHop 0x%x is not a direct neighbor", viaHop);
-            return;  // Can't use as next hop if not direct neighbor
-        }
-        
-        // ETX calculation for our link to the neighbor (same as active)
-        float linkEtx = estimateEtxFromSnr(p->rx_snr);
-        
-        // DV cost estimation: link ETX + conservative path estimate
-        // We use path length + small penalty for uncertainty
-        float estimatedCost = linkEtx + (float)(maxHops - 1) * 1.1f;
-        
-        // Update DV-ETX routing table with passive observation
-        // Note: learnRoute() internally uses EMA smoothing and confidence tracking
-        learnRoute(dest, viaHop, estimatedCost);
-        LOG_INFO("NextHop: PASSIVE LEARN dest=0x%x via=0x%x cost=%.1f SNR=%.1f pathlen=%u [RELAY DISCOVERY]", 
-                 dest, viaHop, estimatedCost, p->rx_snr, (unsigned)maxHops);
-    }
-}
-//fw+
-void NextHopRouter::learnFromRouteDiscoveryPayload(const meshtastic_MeshPacket *p)
+bool NextHopRouter::relayOpaquePacket(const meshtastic_MeshPacket *p)
 {
-    if (!p) {
-        LOG_WARN("NextHop: learnFromRouteDiscoveryPayload called with NULL packet");
-        return;
-    }
-    
-    meshtastic_RouteDiscovery rd = meshtastic_RouteDiscovery_init_zero;
-    if (!pb_decode_from_bytes(p->decoded.payload.bytes, p->decoded.payload.size, &meshtastic_RouteDiscovery_msg, &rd)) {
-        LOG_WARN("NextHop: Failed to decode RouteDiscovery from packet id=0x%x", p->id);
-        return;
+    // Opaque traffic never reaches PacketHistory, NodeDB, modules, phone, or ACK handling (a PKI DM still
+    // goes to MQTT). Relay only from the immutable outer routing header and let hop exhaustion bound it.
+    const auto mode = config.device.rebroadcast_mode;
+    if (!iface || isToUs(p) || isFromUs(p) || p->id == 0 || p->hop_limit == 0 || !isRebroadcaster() || owner.is_licensed ||
+        !IS_ONE_OF(mode, meshtastic_Config_DeviceConfig_RebroadcastMode_ALL,
+                   meshtastic_Config_DeviceConfig_RebroadcastMode_ALL_SKIP_DECODING,
+                   meshtastic_Config_DeviceConfig_RebroadcastMode_CORE_PORTNUMS_ONLY,
+                   meshtastic_Config_DeviceConfig_RebroadcastMode_LOCAL_ONLY,
+                   meshtastic_Config_DeviceConfig_RebroadcastMode_KNOWN_ONLY) ||
+        (p->next_hop != NO_NEXT_HOP_PREFERENCE && p->next_hop != nodeDB->getLastByteOfNodeNum(getNodeNum())))
+        return false;
+
+    // LOCAL_ONLY and KNOWN_ONLY gate on identity, and the only opaque frame carrying its parties in
+    // the header is a PKI-shaped unicast: relay one just when a party is known, which is the rule
+    // RoutingModule applied before opaque frames stopped reaching modules.
+    if (IS_ONE_OF(mode, meshtastic_Config_DeviceConfig_RebroadcastMode_LOCAL_ONLY,
+                  meshtastic_Config_DeviceConfig_RebroadcastMode_KNOWN_ONLY) &&
+        !(p->channel == 0 && !isBroadcast(p->to) &&
+          (nodeInfoLiteHasUser(nodeDB->getMeshNode(p->from)) || nodeInfoLiteHasUser(nodeDB->getMeshNode(p->to)))))
+        return false;
+
+    // Dedup opaque relays. Opaque frames deliberately never enter PacketHistory (so unauthenticated
+    // traffic can't influence routing/ACK/next-hop) - but with NO dedup at all, a dense mesh re-relays
+    // every copy of every frame, multiplying at each hop into an unbounded broadcast storm ("let hop
+    // exhaustion bound it" caps depth, not count). Suppress duplicate opaque rebroadcasts with a small,
+    // routing-isolated seen-set. Genuine originator (re)transmissions (hop_start == hop_limit) are
+    // always relayed so reliable opaque unicast still propagates (mirrors FloodingRouter's isRepeated).
+    const bool isOriginatorTx = p->hop_start > 0 && p->hop_start == p->hop_limit;
+    if (opaqueWasSeenRecently(getFrom(p), p->id) && !isOriginatorTx) {
+        LOG_TRACE("Drop duplicate opaque relay from 0x%08x id 0x%08x", getFrom(p), p->id);
+        return false;
     }
 
-    const size_t maxHops = rd.route_back_count ? rd.route_back_count : rd.route_count;
-    const uint32_t *path = rd.route_back_count ? rd.route_back : rd.route;
-    const size_t maxSnr = rd.snr_back_count ? rd.snr_back_count : rd.snr_towards_count;
-    const int8_t *snrList = rd.snr_back_count ? rd.snr_back : rd.snr_towards;
-    
-    LOG_DEBUG("NextHop: learnFromRouteDiscoveryPayload id=0x%x hops=%u path_type=%s", 
-              p->id, (unsigned)maxHops, rd.route_back_count ? "back" : "forward");
-    
-    //fw+ Skip passive learning for traceroute responses (isToUs) to avoid reversed path bug
-    if (!isToUs(p)) {
-        processPathAndLearn(path, maxHops, snrList, maxSnr, p);
-    }
-    
-    if (isToUs(p) && rd.route_count > 0) {
-        uint8_t firstHop = (uint8_t)(rd.route[0] & 0xFF);
-        if (isDirectNeighborLastByte(firstHop)) {
-            uint32_t destNode = rd.route[rd.route_count - 1];
-            float linkEtx = estimateEtxFromSnr(p->rx_snr);
-            if (rd.snr_towards_count > 0 && rd.snr_towards[0] != INT8_MIN) {
-                linkEtx = estimateEtxFromSnr((float)rd.snr_towards[0] / 4.0f);
-            }
-            int remainingHops = (int)rd.route_count;
-            float observedCost = linkEtx + (remainingHops > 1 ? (remainingHops - 1) * 1.0f : 0.0f);
-            learnRoute(destNode, firstHop, observedCost);
-        } else {
-            // Fallback: if the declared first hop is not our direct neighbor, seed via the actual neighbor that delivered this packet
-            uint8_t viaHop = p->relay_node;
-            if (viaHop != 0 && isDirectNeighborLastByte(viaHop)) {
-                uint32_t destNode = rd.route[rd.route_count - 1];
-                float linkEtx = estimateEtxFromSnr(p->rx_snr);
-                int remainingHops = (int)rd.route_count;
-                float observedCost = linkEtx + (remainingHops > 1 ? (remainingHops - 1) * 1.0f : 0.0f);
-                learnRoute(destNode, viaHop, observedCost);
-                LOG_INFO("NextHop: FALLBACK LEARN (traceroute) dest=0x%x via=0x%x cost=%.1f [RELAY NODE]",
-                         destNode, viaHop, observedCost);
-            }
-        }
-    }
+    meshtastic_MeshPacket *relay = packetPool.allocCopy(*p);
+    if (!relay)
+        return false;
+    relay->hop_limit--;
+#if USERPREFS_EVENT_MODE
+    capEventRelayHops(relay);
+#endif
+    relay->relay_node = nodeDB->getLastByteOfNodeNum(getNodeNum());
+    // The interface declines some packets (NODENUM_BROADCAST_NO_LORA) with ERRNO_SHOULD_RELEASE,
+    // which leaves the copy ours to free. Dropping it here would leak a pool slot per opaque frame.
+    ErrorCode res = Router::send(relay);
+    if (res == ERRNO_SHOULD_RELEASE)
+        packetPool.release(relay);
+    return res == ERRNO_OK;
 }
-//fw+
-void NextHopRouter::learnFromDtnCustodyPath(const uint32_t *path, size_t pathLen)
-{
-    if (!path || pathLen < 2) {
-        LOG_DEBUG("NextHop: learnFromDtnCustodyPath called with invalid path (len=%u)", (unsigned)pathLen);
-        return;
-    }
-    
-    // Call processPathAndLearn with DTN custody chain
-    // No SNR data available from custody chains, so we pass nullptr
-    processPathAndLearn(path, pathLen, nullptr, 0, nullptr);
-    
-    LOG_INFO("NextHop: Learned from DTN custody chain (len=%u)", (unsigned)pathLen);
 
-    //fw+ If we are the final recipient of this custody hop, the chain does not include 'self'.
-    // In that case we can still learn a reliable reverse route TO THE SOURCE via the last carrier
-    // (which must be our bezpośredni sąsiad if we just received it).
-    // This accelerates building a next hop for replies and reduces flooding.
-    {
-        uint32_t selfNum = getNodeNum();
-        bool selfInPath = false;
-        for (size_t i = 0; i < pathLen; ++i) {
-            if (path[i] == selfNum) { selfInPath = true; break; }
-        }
-        if (!selfInPath) {
-            // Last carrier before us (8-bit last byte)
-            uint8_t viaHop = (uint8_t)(path[pathLen - 1] & 0xFF);
-            if (isDirectNeighborLastByte(viaHop)) {
-                // Source is the first element of custody chain
-                uint32_t sourceNode = path[0];
-                // Conservative cost estimate without SNR
-                float observedCost = 1.5f + (pathLen > 1 ? (float)(pathLen - 1) * 1.0f : 0.0f);
-                learnRoute(sourceNode, viaHop, observedCost);
-                LOG_INFO("NextHop: REVERSE LEARN (DTN) src=0x%x via=0x%x cost=%.1f [CUSTODY LAST HOP]",
-                         sourceNode, viaHop, observedCost);
-            } else {
-                LOG_DEBUG("NextHop: Skip REVERSE LEARN (DTN): last carrier 0x%x is not a direct neighbor", viaHop);
-            }
-        }
+// Isolated dedup for opaque relays (see relayOpaquePacket). Returns true if (from,id) is already in the
+// ring; otherwise records it (round-robin eviction) and returns false. A separate table from
+// PacketHistory on purpose: opaque frames must never influence routing/ACK/next-hop. No timestamps -
+// a stale (from,id) can't false-match a later packet because ids are effectively random.
+bool NextHopRouter::opaqueWasSeenRecently(NodeNum from, PacketId id)
+{
+    for (uint8_t i = 0; i < OPAQUE_SEEN_MAX; i++) {
+        if (opaqueSeen[i].sender == from && opaqueSeen[i].id == id)
+            return true;
     }
-}
-//fw+
-void NextHopRouter::learnFromRoutingPayload(const meshtastic_MeshPacket *p)
-{
-    meshtastic_Routing routing = meshtastic_Routing_init_default;
-    if (!pb_decode_from_bytes(p->decoded.payload.bytes, p->decoded.payload.size, &meshtastic_Routing_msg, &routing)) return;
-    const meshtastic_RouteDiscovery *rd = NULL;
-    if (routing.which_variant == meshtastic_Routing_route_reply_tag) rd = &routing.route_reply;
-    else if (routing.which_variant == meshtastic_Routing_route_request_tag) rd = &routing.route_request;
-    if (!rd) return;
-
-    const size_t maxHops = rd->route_back_count ? rd->route_back_count : rd->route_count;
-    const uint32_t *path = rd->route_back_count ? rd->route_back : rd->route;
-    const size_t maxSnr = rd->snr_back_count ? rd->snr_back_count : rd->snr_towards_count;
-    const int8_t *snrList = rd->snr_back_count ? rd->snr_back : rd->snr_towards;
-    processPathAndLearn(path, maxHops, snrList, maxSnr, p);
-}
-//fw+ dv-etx
-bool NextHopRouter::lookupRoute(uint32_t dest, RouteEntry &out)
-{
-    auto it = routes.find(dest);
-    if (it == routes.end()) return false;
-    const RouteEntry &r = it->second;
-    // TTL (adaptive) and minimal confidence gate //fw+
-    uint32_t now = millis();
-    uint32_t ttlMs = computeRouteTtlMs(r.confidence);
-    // fw+ shrink effective TTL when mobile (factor 0..1 => cut up to 80%)
-    float mobility = fwplus_getMobilityFactor01();
-    uint32_t ttlAdj = (uint32_t)((float)ttlMs * (1.0f - 0.8f * mobility));
-    if (now - r.lastUpdatedMs > ttlAdj) return false;
-    // fw+ lower confidence gate slightly for mobile
-    uint8_t minConf = getMinConfidenceToUse();
-    if (mobility > 0.5f && minConf > 0) minConf -= 1;
-    if (r.confidence < minConf) return false;
-    out = r;
-    return (out.next_hop != NO_NEXT_HOP_PREFERENCE);
-}
-//fw+ dv-etx
-void NextHopRouter::learnRoute(uint32_t dest, uint8_t viaHop, float observedCost)
-{
-    if (viaHop == NO_NEXT_HOP_PREFERENCE) return;
-    // Safety: never learn a route via a non-direct neighbor
-    if (!isDirectNeighborLastByte(viaHop)) return;
-    RouteEntry &r = routes[dest];
-    if (r.confidence == 0) {
-        r.aggregated_cost = observedCost;
-    } else {
-        // Smooth update with mobility-aware alpha //fw+
-        float mobility = fwplus_getMobilityFactor01();
-        float alphaNew = 0.3f + mobility * (0.7f - 0.3f); // 0.3..0.7
-        r.aggregated_cost = (1.0f - alphaNew) * r.aggregated_cost + alphaNew * observedCost;
-    }
-    // Update backup if the new candidate is different and better than current
-    if (r.next_hop != viaHop) {
-        if (r.next_hop == NO_NEXT_HOP_PREFERENCE) {
-            r.next_hop = viaHop;
-        } else {
-            // Decide which is primary/backup by cost
-            if (observedCost < (r.aggregated_cost - getHysteresisThreshold())) {
-                // Promote new as primary, demote old to backup
-                r.backup_next_hop = r.next_hop;
-                r.backup_cost = r.aggregated_cost;
-                r.next_hop = viaHop;
-                r.aggregated_cost = observedCost;
-            } else {
-                // Keep current primary, maybe store/upgrade backup
-                if (r.backup_next_hop == NO_NEXT_HOP_PREFERENCE || observedCost < r.backup_cost || r.backup_next_hop == viaHop) {
-                    r.backup_next_hop = viaHop;
-                    r.backup_cost = observedCost;
-                }
-            }
-        }
-    }
-    r.lastUpdatedMs = millis();
-    if (r.confidence < 255) r.confidence++;
-}
-//fw+ dv-etx
-void NextHopRouter::invalidateRoute(uint32_t dest, float penalty)
-{
-    auto it = routes.find(dest);
-    if (it == routes.end()) return;
-    RouteEntry &r = it->second;
-    r.aggregated_cost += penalty;
-    if (r.confidence > 0) r.confidence--;
-    r.lastUpdatedMs = millis();
-}
-//fw+
-float NextHopRouter::getHysteresisThreshold() const
-{
-    float thr = 0.5f;
-    if (moduleConfig.has_node_mod_admin && moduleConfig.node_mod_admin.hysteresis_cost_threshold_tenths) {
-        thr = (float)moduleConfig.node_mod_admin.hysteresis_cost_threshold_tenths / 10.0f;
-    }
-    return thr;
-}
-//fw+
-uint8_t NextHopRouter::getMinConfidenceToUse() const
-{
-    uint8_t minConf = 0;
-    if (moduleConfig.has_node_mod_admin && moduleConfig.node_mod_admin.min_confidence_to_use) {
-        minConf = moduleConfig.node_mod_admin.min_confidence_to_use;
-    }
-    return minConf;
-}
-//fw+ dv-etx
-float NextHopRouter::estimateEtxFromSnr(float snr) const
-{
-    if (snr >= 10.0f) return 1.2f;
-    if (snr >= 5.0f) return 1.6f;
-    if (snr >= 0.0f) return 2.2f;
-    return 3.0f;
+    // Not seen: record it, overwriting the oldest-written slot (FIFO). Empty slots hold id 0, which a
+    // real entry never has (relayOpaquePacket drops id 0), so they simply never match above.
+    opaqueSeen[opaqueSeenNext].sender = from;
+    opaqueSeen[opaqueSeenNext].id = id;
+    opaqueSeenNext = (uint8_t)((opaqueSeenNext + 1) % OPAQUE_SEEN_MAX);
+    return false;
 }
 
 PendingPacket::PendingPacket(meshtastic_MeshPacket *p, uint8_t numRetransmissions)
 {
     packet = p;
     this->numRetransmissions = numRetransmissions - 1; // We subtract one, because we assume the user just did the first send
+    this->initialNumRetransmissions = this->numRetransmissions;
 }
 
 /**
@@ -322,47 +108,24 @@ PendingPacket::PendingPacket(meshtastic_MeshPacket *p, uint8_t numRetransmission
 ErrorCode NextHopRouter::send(meshtastic_MeshPacket *p)
 {
     nexthop_counter++;
+    return sendWithNextHop(p, true);
+}
+
+ErrorCode NextHopRouter::sendWithNextHop(meshtastic_MeshPacket *p, bool trackRetransmission)
+{
     // Add any messages _we_ send to the seen message list (so we will ignore all retransmissions we see)
     p->relay_node = nodeDB->getLastByteOfNodeNum(getNodeNum()); // First set the relayer to us
     wasSeenRecently(p);                                         // FIXME, move this to a sniffSent method
 
-    // fw+, for unicasts, try passive DV-ETX route first; else fallback to legacy next_hop/none
-    if (!isBroadcast(p->to) && !isToUs(p)) {
-        RouteEntry r;
-        if (lookupRoute(p->to, r)) {
-            p->next_hop = r.next_hop;
-            LOG_INFO("DV-ETX next hop for %x -> %x (cost=%.2f, conf=%u)", p->to, p->next_hop, r.aggregated_cost,
-                     r.confidence);
-        } else {
-            p->next_hop = getNextHop(p->to, p->relay_node).value_or(NO_NEXT_HOP_PREFERENCE);
-            LOG_DEBUG("Legacy next hop for %x -> %x", p->to, p->next_hop);
-        }
-    } else {
-        p->next_hop = getNextHop(p->to, p->relay_node).value_or(NO_NEXT_HOP_PREFERENCE);
-        LOG_DEBUG("Setting next hop for packet with dest %x to %x", p->to, p->next_hop);
-    }
+    p->next_hop = getNextHop(p->to, p->relay_node).value_or(NO_NEXT_HOP_PREFERENCE); // set the next hop
+    LOG_TRACE("Set next hop for dest 0x%08x to 0x%x", p->to, p->next_hop);
 
     // If it's from us, ReliableRouter already handles retransmissions if want_ack is set. If a next hop is set and hop limit is
     // not 0 or want_ack is set, start retransmissions
-    if ((!isFromUs(p) || !p->want_ack) && p->next_hop != NO_NEXT_HOP_PREFERENCE && (p->hop_limit > 0 || p->want_ack)) {
-        // Safety: ensure chosen next_hop corresponds to some direct neighbor; else fallback to flooding
-        if (!isDirectNeighborLastByte(p->next_hop)) {
-            LOG_INFO("DV-ETX next_hop 0x%x not a direct neighbor; fallback to flooding", p->next_hop);
-            p->next_hop = NO_NEXT_HOP_PREFERENCE;
-        }
-        //fw+ use dedicated retransmission pool first to avoid starving main pool
-        {
-            auto cpy = retransPacketPool.allocCopy(*p);
-            if (!cpy) {
-                LOG_WARN("Retrans pool empty; trying main packetPool for relay copy");
-                cpy = packetPool.allocCopy(*p);
-            }
-            if (!cpy) {
-                LOG_WARN("No slot for relay copy; skipping retransmission schedule");
-            } else {
-                startRetransmission(cpy); // start retransmission for relayed packet
-            }
-        }
+    if (trackRetransmission && (!isFromUs(p) || !p->want_ack) && p->next_hop != NO_NEXT_HOP_PREFERENCE &&
+        (p->hop_limit > 0 || p->want_ack)) {
+        if (auto *copy = packetPool.allocCopy(*p))
+            startRetransmission(copy); // start retransmission for relayed packet
     }
 
     return Router::send(p);
@@ -389,25 +152,21 @@ bool NextHopRouter::shouldFilterReceived(const meshtastic_MeshPacket *p)
             stopRetransmission(p->from, p->id);
         }
 
-        //fw+ notify BroadcastAssist about upstream duplicate drops (by sender+id) without including module headers
-        extern void fwplus_ba_onOverheardFromId(uint32_t from, uint32_t id);
-        fwplus_ba_onOverheardFromId(getFrom(p), p->id);
-
         // If it was a fallback to flooding, try to relay again
         if (wasFallback) {
             LOG_INFO("Fallback to flooding from relay_node=0x%x", p->relay_node);
             // Check if it's still in the Tx queue, if not, we have to relay it again
             if (!findInTxQueue(p->from, p->id)) {
-                reprocessPacket(p);
-                perhapsRebroadcast(p);
+                if (reprocessPacket(p))
+                    perhapsRebroadcast(p);
             }
         } else {
             bool isRepeated = getHopsAway(*p) == 0;
             // If repeated and not in Tx queue anymore, try relaying again, or if we are the destination, send the ACK again
             if (isRepeated) {
                 if (!findInTxQueue(p->from, p->id)) {
-                    reprocessPacket(p);
-                    if (!perhapsRebroadcast(p) && isToUs(p) && p->want_ack) {
+                    if (reprocessPacket(p) && !isBlockedEventCoordinatePacket(p) && !perhapsRebroadcast(p) && isToUs(p) &&
+                        p->want_ack) {
                         sendAckNak(meshtastic_Routing_Error_NONE, getFrom(p), p->id, p->channel, 0);
                     }
                 }
@@ -418,49 +177,8 @@ bool NextHopRouter::shouldFilterReceived(const meshtastic_MeshPacket *p)
         return true;
     }
 
-    bool r = Router::shouldFilterReceived(p);
-    // Observe traceroute traffic for scheduler cooldowns
-    if (p->which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
-        p->decoded.portnum == meshtastic_PortNum_TRACEROUTE_APP) {
-        uint32_t now = millis();
-        lastHeardTracerouteMs = now;
-        if (!isBroadcast(p->to)) perDestLastHeardRouteMs[p->to] = now;
-    }
-    return r;
+    return Router::shouldFilterReceived(p);
 }
-//fw+ compute ring and apply HeardAssist policy
-bool NextHopRouter::shouldRelayTextWithThrottle(const meshtastic_MeshPacket *p, uint32_t &outJitterMs) const
-{
-    outJitterMs = 0;
-    uint32_t now = millis();
-    if (!heardThrottle.isActive(now)) return true; // no policy → allow
-    // compute ring from hop_start and hop_limit if available
-    uint32_t ring = 0;
-    if (p->hop_start != 0 && p->hop_limit <= p->hop_start) ring = (uint32_t)(p->hop_start - p->hop_limit);
-    if (ring == 0) return true;
-    if (heardThrottle.scope_min_ring && ring < heardThrottle.scope_min_ring) {
-        // near area: strong suppression (only 1 elected ideally)
-        // Fall through to election anyway with very low percent if configured 0
-    }
-    uint8_t pct = heardThrottle.percent_per_ring[ring];
-    if (pct == 0) {
-        // cluster policy fallback: near/mid/far groups
-        if (ring <= 2) pct = 1;         // near (r1-2)
-        else if (ring <= 4) pct = 2;    // mid (r3-4)
-        else pct = 3;                   // far (r5-7)
-    }
-    // deterministic election: hash(packet_id, our_last_byte, ring) % 100 < pct
-    uint32_t h = 1469598103u;
-    auto mix = [&](uint32_t v) { h ^= v; h *= 16777619u; };
-    mix(p->id);
-    mix(nodeDB->getLastByteOfNodeNum(nodeDB->getNodeNum()));
-    mix(ring);
-    bool elected = (h % 100) < pct;
-    if (!elected) return false;
-    outJitterMs = heardThrottle.jitter_base_ms + ring * heardThrottle.jitter_slope_ms + (random(33));
-    return true;
-}
-
 
 void NextHopRouter::sniffReceived(const meshtastic_MeshPacket *p, const meshtastic_Routing *c)
 {
@@ -474,27 +192,38 @@ void NextHopRouter::sniffReceived(const meshtastic_MeshPacket *p, const meshtast
         // destination
         if (p->from != 0) {
             meshtastic_NodeInfoLite *origTx = nodeDB->getMeshNode(p->from);
-            if (origTx) {
-                // Either relayer of ACK was also a relayer of the packet, or we were the *only* relayer and the ACK came
-                // directly from the destination
-                // Single lookup for both relayer checks on the same (request_id, to) pair
-                bool wasAlreadyRelayer = false;
-                bool weWereSoleRelayer = false;
-                bool weWereRelayer = false;
-                checkRelayers(p->relay_node, ourRelayID, p->decoded.request_id, p->to, &wasAlreadyRelayer, &weWereRelayer,
-                              &weWereSoleRelayer);
-                if ((weWereRelayer && wasAlreadyRelayer) || (getHopsAway(*p) == 0 && weWereSoleRelayer)) {
-                    if (origTx->next_hop != p->relay_node) { // Not already set
-                        LOG_INFO("Update next hop of 0x%x to 0x%x based on ACK/reply (was relayer %d we were sole %d)", p->from,
+            // Either relayer of ACK was also a relayer of the packet, or we were the *only* relayer and the ACK came
+            // directly from the destination. checkRelayers is read-only on PacketHistory and O(1), so we run it even
+            // when origTx is absent - that lets us still capture the confirmed hop into the TMM overflow cache below.
+            // Single lookup for both relayer checks on the same (request_id, to) pair
+            bool wasAlreadyRelayer = false;
+            bool weWereSoleRelayer = false;
+            bool weWereRelayer = false;
+            checkRelayers(p->relay_node, ourRelayID, p->decoded.request_id, p->to, &wasAlreadyRelayer, &weWereRelayer,
+                          &weWereSoleRelayer);
+            if ((weWereRelayer && wasAlreadyRelayer) || (getHopsAway(*p) == 0 && weWereSoleRelayer)) {
+                // M1/M2: only learn a next hop whose last byte maps to a single plausible relay. On a dense
+                // mesh the byte may be ambiguous; storing it would aim future DMs at the wrong node. This gate
+                // now protects BOTH the hot-store route (NodeInfoLite.next_hop) AND the TMM overflow cache -
+                // the overflow cache deliberately holds many more next-hop bytes (long-tail nodes), so it is
+                // even more collision-prone and must never store an ambiguous byte either. Ambiguous/unknown
+                // -> store nothing and keep flooding (safe).
+                if (nodeDB->resolveUniqueLastByte(p->relay_node, /*requireDirectNeighbor=*/false)) {
+                    if (origTx && origTx->next_hop != p->relay_node) { // Not already set
+                        LOG_INFO("Update next hop of 0x%08x to 0x%x from ACK/reply (was relayer %d we were sole %d)", p->from,
                                  p->relay_node, wasAlreadyRelayer, weWereSoleRelayer);
                         origTx->next_hop = p->relay_node;
                     }
-
-                    // FW+: lightweight DV-ETX hint only if the relayer is a direct neighbor
-                    if (isDirectNeighborLastByte(p->relay_node)) {
-                        float hopCost = estimateEtxFromSnr(p->rx_snr) + 1.0f; // local hop + ahead estimate
-                        learnRoute(origTx->num, p->relay_node, hopCost);
-                    }
+                    noteRouteLearned(p->from, p->relay_node, Time::stampMillis()); // M3: anchor freshness (hot or overflow route)
+#if HAS_TRAFFIC_MANAGEMENT
+                    // Mirror the confirmed (and now unique-resolved) hop into the TMM overflow cache so it
+                    // survives even when the source isn't (or is no longer) in the hot NodeDB.
+                    if (trafficManagementModule)
+                        trafficManagementModule->setNextHop(p->from, p->relay_node);
+#endif
+                } else {
+                    LOG_DEBUG("Not learning next hop for 0x%08x: relay byte 0x%x ambiguous/unknown; keep flooding", p->from,
+                              p->relay_node);
                 }
             }
         }
@@ -505,152 +234,89 @@ void NextHopRouter::sniffReceived(const meshtastic_MeshPacket *p, const meshtast
         }
     }
 
-    //fw+ traceroute learning: if this is a traceroute/routing control with route info, learn next-hop hints
-    if (p->which_payload_variant == meshtastic_MeshPacket_decoded_tag) {
-        if (p->decoded.portnum == meshtastic_PortNum_TRACEROUTE_APP) {
-            learnFromRouteDiscoveryPayload(p);
-        } else if (p->decoded.portnum == meshtastic_PortNum_ROUTING_APP) {
-            learnFromRoutingPayload(p);
-        }
-    }
-
     perhapsRebroadcast(p);
-    //fw+ delegate proactive scheduling to a helper to ease upstream merges
-    maybeScheduleTraceroute(millis());
 
     // handle the packet as normal
     Router::sniffReceived(p, c);
 }
 
-//fw+
-bool NextHopRouter::canProbeGlobal(uint32_t now) const
+/* Check if we should be rebroadcasting this packet if so, do so. */
+// fw+: telemetry limiter. Off by default. In auto mode it only applies above the channel-utilization threshold.
+bool NextHopRouter::isTelemetryRebroadcastLimited(const meshtastic_MeshPacket *p)
 {
-    if (!moduleConfig.has_node_mod_admin || !moduleConfig.node_mod_admin.proactive_traceroute_enabled) return false;
-    uint32_t cooldownH = moduleConfig.node_mod_admin.traceroute_global_cooldown_hours ?: 12;
-    uint32_t maxPerDay = moduleConfig.node_mod_admin.traceroute_max_per_day ?: 6;
-    bool cooldownOk = (lastHeardTracerouteMs == 0 || (now - lastHeardTracerouteMs) >= cooldownH * 3600000UL) &&
-                      (lastProbeGlobalMs == 0 || (now - lastProbeGlobalMs) >= cooldownH * 3600000UL);
-    bool dayBudgetOk = (probesTodayCounter < maxPerDay);
-    float util = airTime->channelUtilizationPercent();
-    uint32_t utilThr = moduleConfig.node_mod_admin.traceroute_chanutil_threshold_percent ?: 15;
-    bool utilOk = util < (float)utilThr;
-    return cooldownOk && dayBudgetOk && utilOk;
-}
+    (void)p;
+    const auto &admin = moduleConfig.node_mod_admin;
+    if (!admin.telemetry_limiter_enabled)
+        return false;
+    if (admin.telemetry_limiter_auto_chanutil_enabled &&
+        airTime->channelUtilizationPercent() < (float)admin.telemetry_limiter_auto_chanutil_threshold)
+        return false;
 
-//fw+ DV-ETX adaptation from S&F custody: reward successful path
-void NextHopRouter::rewardRouteOnDelivered(PacketId originalId, NodeNum sourceNode, uint8_t viaHopLastByte, int8_t rxSnr)
-{
-    // Only adapt for unicasts sourced by sourceNode (DMs). We map delivered notice back to dest = 0 for now,
-    // because we don't carry explicit destination here. Use source context and last-hop hint.
-    (void)originalId; // currently unused in aggregation
-    if (viaHopLastByte == NO_NEXT_HOP_PREFERENCE) return;
-
-    // Heuristic: treat observed cost as good (local hop from viaHop + 0.5 ahead)
-    float hopCost = estimateEtxFromSnr((float)rxSnr) + 0.5f;
-    // Use learnRoute keyed by destination = sourceNode (we want better path TO sourceNode for replies)
-    learnRoute(sourceNode, viaHopLastByte, hopCost);
-}
-
-//fw+ DV-ETX adaptation from S&F custody: penalize failing path
-void NextHopRouter::penalizeRouteOnFailed(PacketId originalId, NodeNum sourceNode, uint8_t viaHopLastByte, uint32_t reasonCode)
-{
-    (void)originalId;
-    (void)viaHopLastByte;
-    // Map routing error to penalty magnitude
-    float penalty = 0.8f; // base
-    switch ((meshtastic_Routing_Error)reasonCode) {
-    case meshtastic_Routing_Error_NO_CHANNEL:
-    case meshtastic_Routing_Error_PKI_UNKNOWN_PUBKEY:
-        penalty = 1.5f; // strong penalty for terminal NAK
-        break;
-    case meshtastic_Routing_Error_DUTY_CYCLE_LIMIT:
-        penalty = 0.3f; // transient congestion
-        break;
-    default:
-        penalty = 0.8f;
-        break;
+    const uint32_t now = millis();
+    if (now - telemetryWindowStartMs >= 60000UL) {
+        telemetryWindowStartMs = now;
+        telemetryPacketsInWindow = 0;
     }
-    invalidateRoute(sourceNode, penalty);
-}
-//fw+
-bool NextHopRouter::canProbeDest(uint32_t dest, uint32_t now) const
-{
-    auto it = perDestLastProbeMs.find(dest);
-    uint32_t lastP = (it == perDestLastProbeMs.end()) ? 0 : it->second;
-    uint32_t perH = moduleConfig.node_mod_admin.traceroute_per_dest_cooldown_hours ?: 12;
-    if (lastP && (now - lastP) < perH * 3600000UL) return false;
-    auto it2 = perDestLastHeardRouteMs.find(dest);
-    uint32_t lastH = (it2 == perDestLastHeardRouteMs.end()) ? 0 : it2->second;
-    uint32_t globH = moduleConfig.node_mod_admin.traceroute_global_cooldown_hours ?: 12;
-    if (lastH && (now - lastH) < globH * 3600000UL) return false;
-    return true;
-}
-//fw+
-bool NextHopRouter::maybeScheduleTraceroute(uint32_t now)
-{
-    if (!moduleConfig.has_node_mod_admin || !moduleConfig.node_mod_admin.proactive_traceroute_enabled) return false;
-
-    if (probesDayStartMs == 0 || now - probesDayStartMs > 24UL * 60UL * 60UL * 1000UL) {
-        probesDayStartMs = now;
-        probesTodayCounter = 0;
-    }
-
-    float staleRatio = computeStaleRatio(now);
-    uint32_t thr = moduleConfig.node_mod_admin.traceroute_stale_ratio_threshold_percent ?: 30;
-    if (staleRatio < (float)thr) return false;
-    if (!canProbeGlobal(now)) return false;
-
-    uint32_t chosenDest = 0;
-    for (const auto &kv : routes) {
-        const uint32_t dest = kv.first;
-        const RouteEntry &r = kv.second;
-        if (r.next_hop == NO_NEXT_HOP_PREFERENCE) continue;
-        if (!isRouteStale(r, now)) continue;
-        if (!canProbeDest(dest, now)) continue;
-        chosenDest = dest;
-        break;
-    }
-    if (!chosenDest) return false;
-
-    if (sendTracerouteTo(chosenDest)) {
-        lastProbeGlobalMs = now;
-        perDestLastProbeMs[chosenDest] = now;
-        probesTodayCounter++;
+    if (telemetryPacketsInWindow >= admin.telemetry_limiter_packets_per_minute) {
+        LOG_DEBUG("Telemetry limiter: limit reached (%u/min)", admin.telemetry_limiter_packets_per_minute);
         return true;
     }
+    telemetryPacketsInWindow++;
     return false;
 }
-//fw+
-bool NextHopRouter::sendTracerouteTo(uint32_t dest)
+
+void NextHopRouter::rememberForwardedPosition(NodeNum nodeId, int32_t latitudeI, int32_t longitudeI, uint32_t nowMs)
 {
-    meshtastic_MeshPacket *p = router->allocForSending();
-    if (!p) return false;
-    p->to = dest;
-    p->decoded.portnum = meshtastic_PortNum_TRACEROUTE_APP;
-    p->decoded.want_response = true;
-    meshtastic_RouteDiscovery req = meshtastic_RouteDiscovery_init_zero;
-    p->decoded.payload.size = pb_encode_to_bytes(p->decoded.payload.bytes, sizeof(p->decoded.payload.bytes), &meshtastic_RouteDiscovery_msg, &req);
+    if (forwardedPositionsCount == FORWARDED_POSITIONS) {
+        // table full: drop the oldest entry
+        for (size_t i = 1; i < FORWARDED_POSITIONS; i++)
+            forwardedPositions[i - 1] = forwardedPositions[i];
+        forwardedPositionsCount--;
+    }
+    forwardedPositions[forwardedPositionsCount++] = {nodeId, latitudeI, longitudeI, nowMs};
+}
 
-    uint32_t startHop = moduleConfig.node_mod_admin.traceroute_expanding_ring_initial_hop ?: 1;
-    uint32_t maxHops = moduleConfig.node_mod_admin.traceroute_expanding_ring_max_hops ?: 3;
-    meshtastic_NodeInfoLite *ninfo = nodeDB->getMeshNode(dest);
-    if (ninfo && ninfo->hops_away)
-        p->hop_limit = min((uint32_t)(ninfo->hops_away + 1), maxHops);
-    else
-        p->hop_limit = startHop;
+// fw+: position limiter. A node's unchanged position is relayed at most once per threshold.
+// The fork also accepts a small distance tolerance; this port compares coordinates exactly.
+bool NextHopRouter::isPositionRebroadcastAllowed(const meshtastic_MeshPacket *p)
+{
+    const auto &admin = moduleConfig.node_mod_admin;
+    if (!admin.position_limiter_enabled || admin.position_limiter_time_minutes_threshold == 0)
+        return true;
 
-    p->priority = meshtastic_MeshPacket_Priority_BACKGROUND;
-    uint32_t jitter = moduleConfig.node_mod_admin.traceroute_probe_jitter_ms ?: 5000;
-    if (jitter) p->tx_after = millis() + (random(jitter + 1));
+    meshtastic_Position pos = meshtastic_Position_init_default;
+    if (!pb_decode_from_bytes(p->decoded.payload.bytes, p->decoded.payload.size, &meshtastic_Position_msg, &pos))
+        return true; // cannot decode: fail open
 
-    service->sendToMesh(p, RX_SRC_LOCAL, false);
-    LOG_INFO("Scheduled proactive traceroute to 0x%x, hop_limit=%u", dest, p->hop_limit);
+    const uint32_t now = millis();
+    const uint32_t thresholdMs = admin.position_limiter_time_minutes_threshold * 60000UL;
+    for (size_t i = 0; i < forwardedPositionsCount; i++) {
+        ForwardedPosition &entry = forwardedPositions[i];
+        if (entry.nodeId != p->from)
+            continue;
+        const bool unchanged = entry.latitudeI == pos.latitude_i && entry.longitudeI == pos.longitude_i;
+        if (unchanged && (now - entry.lastRelayMs) < thresholdMs)
+            return false;
+        entry.latitudeI = pos.latitude_i;
+        entry.longitudeI = pos.longitude_i;
+        entry.lastRelayMs = now;
+        return true;
+    }
+    rememberForwardedPosition(p->from, pos.latitude_i, pos.longitude_i, now);
     return true;
 }
 
-// fw+ Check if we should be rebroadcasting this packet (with HeardAssist throttle and retrans pool)
 bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
 {
+#if USERPREFS_BLOCK_POSITION_ON_EVENT_CHANNEL
+    // Never relay coordinate-bearing packets on the event ("everyone") channel.
+    // Closes the reliable-retransmit-dupe path that runs before handleReceived().
+    if (isBlockedEventCoordinatePacket(p)) {
+        return false;
+    }
+#endif
+
+    // Check if traffic management wants to exhaust this packet's hops
     bool exhaustHops = false;
 #if HAS_TRAFFIC_MANAGEMENT
     if (trafficManagementModule && trafficManagementModule->shouldExhaustHops(*p)) {
@@ -658,69 +324,60 @@ bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
     }
 #endif
 
-    // fw+
-    if (!isToUs(p) && (p->hop_limit <= 0) && !isFromUs(p) && !exhaustHops) {
-        blocked_by_hoplimit++;
+    // fw+ limiters: only for decoded packets we would relay (someone else's, not to us, hop budget left)
+    if (p->which_payload_variant == meshtastic_MeshPacket_decoded_tag && !isToUs(p) && !isFromUs(p) && p->hop_limit > 0) {
+        if (p->decoded.portnum == meshtastic_PortNum_TELEMETRY_APP && isTelemetryRebroadcastLimited(p))
+            return false;
+        if (p->decoded.portnum == meshtastic_PortNum_POSITION_APP && isBroadcast(p->to) && !isPositionRebroadcastAllowed(p))
+            return false;
     }
 
-    // Allow rebroadcast if hop_limit > 0 OR if we're exhausting hops (one relay with hop_limit = 0)
+    if (p->to == NODENUM_BROADCAST_NO_LORA)
+        return false;
+
+    // Allow rebroadcast if hop_limit > 0 OR if we're exhausting hops (which sets hop_limit = 0 but still needs one relay)
     if (!isToUs(p) && !isFromUs(p) && (p->hop_limit > 0 || exhaustHops)) {
-        // fw+ Optional throttle for text broadcasts based on HeardAssist (only when hops remain)
-        if (p->hop_limit > 0 && p->which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
-            p->decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP) {
-            uint32_t jitter = 0;
-            if (shouldRelayTextWithThrottle(p, jitter)) {
-                meshtastic_MeshPacket *tosend = retransPacketPool.allocCopy(*p);
-                if (!tosend)
-                    tosend = packetPool.allocCopy(*p);
-                if (tosend) {
-                    tosend->hop_limit--;
-                    if (jitter)
-                        tosend->tx_after = millis() + jitter;
-                    NextHopRouter::send(tosend);
-                } else {
-                    LOG_WARN("Pool exhausted; skipping throttled relay");
-                }
-                return true;
-            } else {
-                return false; // suppressed by throttle
-            }
-        }
         if (p->id != 0) {
             if (isRebroadcaster()) {
+                // NOTE: this is a self-identity match (is the addressed next_hop OUR last byte?), so it
+                // cannot be hardened with resolveLastByte() - a remote node that legitimately shares our
+                // last byte will also match here and rebroadcast. That residual collision needs a wider
+                // on-wire field to fix. M1/M2 instead shrink the blast radius by reducing how often an
+                // ambiguous next_hop byte is ever learned (sniffReceived) or originated (getNextHop).
                 if (p->next_hop == NO_NEXT_HOP_PREFERENCE || p->next_hop == nodeDB->getLastByteOfNodeNum(getNodeNum())) {
-                    // fw+ use retrans pool first; preserve hop_limit when policy dictates
-                    meshtastic_MeshPacket *tosend = retransPacketPool.allocCopy(*p);
+                    meshtastic_MeshPacket *tosend = packetPool.allocCopy(*p); // keep a copy because we will be sending it
                     if (!tosend)
-                        tosend = packetPool.allocCopy(*p);
-                    if (tosend) {
-                        LOG_INFO("Rebroadcast received message coming from %x", p->relay_node);
+                        return true;
+                    LOG_INFO("Rebroadcast msg from %x", p->relay_node);
 
-                        if (exhaustHops) {
-                            tosend->hop_limit = 0;
-                            LOG_INFO("Traffic management: exhausting hops for 0x%08x, setting hop_limit=0", getFrom(p));
-                        } else if (shouldDecrementHopLimit(p)) {
-                            tosend->hop_limit--; // bump down the hop count
-                        } else {
-                            LOG_INFO("favorite-ROUTER/CLIENT_BASE-to-ROUTER/CLIENT_BASE rebroadcast: preserving hop_limit");
-                        }
+                    // If exhausting hops, force hop_limit = 0 regardless of other logic
+                    if (exhaustHops) {
+                        tosend->hop_limit = 0;
+                        LOG_INFO("Traffic management: exhaust hops for 0x%08x, hop_limit=0", getFrom(p));
+                    } else if (shouldDecrementHopLimit(p)) {
+                        // Use shared logic to determine if hop_limit should be decremented
+                        tosend->hop_limit--; // bump down the hop count
+                    } else {
+                        LOG_INFO("favorite-ROUTER/CLIENT_BASE-to-ROUTER/CLIENT_BASE rebroadcast: keep hop_limit");
+                    }
 #if USERPREFS_EVENT_MODE
-                        if (tosend->hop_limit > 2) {
-                            // if we are "correcting" the hop_limit, "correct" the hop_start by the same amount to preserve hops away.
-                            tosend->hop_start -= (tosend->hop_limit - 2);
-                            tosend->hop_limit = 2;
-                        }
+                    capEventRelayHops(tosend);
 #endif
 
-                        if (p->next_hop == NO_NEXT_HOP_PREFERENCE) {
-                            FloodingRouter::send(tosend);
-                        } else {
-                            NextHopRouter::send(tosend);
-                        }
-                        return true;
-                    } else {
-                        LOG_WARN("Pool exhausted; skipping relay");
+                    // fw+ opportunistic flooding: a broadcast relay waits a computed delay, and cancels if it hears the relay first
+                    if (isOpportunisticEnabled() && isBroadcast(tosend->to)) {
+                        const uint32_t delayMs = computeOpportunisticDelayMs(p);
+                        if (delayMs > 0)
+                            tosend->tx_after = millis() + delayMs;
+                        opportunistic_scheduled++;
                     }
+
+                    ErrorCode res =
+                        (p->next_hop == NO_NEXT_HOP_PREFERENCE) ? FloodingRouter::send(tosend) : NextHopRouter::send(tosend);
+                    if (res == ERRNO_SHOULD_RELEASE)
+                        packetPool.release(tosend);
+
+                    return true;
                 }
             } else {
                 LOG_DEBUG("No rebroadcast: Role = CLIENT_MUTE or Rebroadcast Mode = NONE");
@@ -742,15 +399,63 @@ std::optional<uint8_t> NextHopRouter::getNextHop(NodeNum to, uint8_t relay_node)
     if (isBroadcast(to))
         return std::nullopt;
 
+    // Hot store first: a direct array hit on the live NodeDB entry.
     meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(to);
     if (node && node->next_hop) {
+        // M3: proactively decay a stale or repeatedly-failing route back to flooding, so a dead hop
+        // isn't trusted on the next DM's first (and on dense meshes, slowest) attempt. We only act on
+        // a health record that still matches the stored byte; a next_hop set by another path (e.g.
+        // TraceRouteModule) with no matching record is left authoritative.
+        const RouteHealth *h = findRouteHealth(to);
+        if (h && h->lastNextHop == node->next_hop && isRouteStale(*h, Time::stampMillis())) {
+            LOG_INFO("Next hop 0x%x for 0x%08x stale (age/fails); flood and clear", node->next_hop, to);
+            node->next_hop = NO_NEXT_HOP_PREFERENCE; // clear persisted route
+            clearRouteHealth(to);                    // clear RAM health
+            return std::nullopt;
+        }
+
         // We are careful not to return the relay node as the next hop
         if (node->next_hop != relay_node) {
-            LOG_DEBUG("Next hop for 0x%x is 0x%x", to, node->next_hop);
-            return node->next_hop;
+            // M1/M2: only emit a stored next_hop if its last byte still maps to a UNIQUE, currently
+            // reachable direct neighbor. On a dense mesh the last byte collides, so an ambiguous byte
+            // would unicast a hint toward the wrong physical node; if the neighbor has gone away we'd
+            // unicast into a void. In both cases flood instead (managed flooding still delivers).
+            ResolvedNode r = nodeDB->resolveLastByte(node->next_hop, /*requireDirectNeighbor=*/true);
+            if (r.status == LastByteResolution::Unique)
+                return node->next_hop;
+            LOG_WARN("Next hop 0x%x for 0x%08x %s; set no pref", node->next_hop, to,
+                     r.status == LastByteResolution::Ambiguous ? "ambiguous among neighbors" : "not a known neighbor");
         } else
-            LOG_WARN("Next hop for 0x%x is 0x%x, same as relayer; set no pref", to, node->next_hop);
+            LOG_WARN("Next hop for 0x%08x is 0x%x, same as relayer; set no pref", to, node->next_hop);
     }
+
+#if HAS_TRAFFIC_MANAGEMENT
+    // Fallback: TMM overflow cache holds confirmed hops for nodes that have aged out of the hot store.
+    // It is the same byte source/confidence as NodeInfoLite.next_hop, so it gets the same M1/M2/M3
+    // protection: decay a stale/failing route, then only emit a byte that still resolves to a unique
+    // reachable neighbor. Without this the overflow cache (which holds MORE bytes for MORE nodes) would
+    // reintroduce exactly the silent-misroute that M1/M2 closes on the hot path.
+    if (trafficManagementModule) {
+        uint8_t hint = trafficManagementModule->getNextHopHint(to);
+        if (hint && hint != relay_node) {
+            const RouteHealth *h = findRouteHealth(to);
+            if (h && h->lastNextHop == hint && isRouteStale(*h, Time::stampMillis())) {
+                LOG_INFO("TMM next hop 0x%x for 0x%08x stale (age/fails); flood and clear", hint, to);
+                trafficManagementModule->clearNextHop(to); // clear overflow route (setNextHop won't store 0)
+                clearRouteHealth(to);                      // clear RAM health
+                return std::nullopt;
+            }
+            ResolvedNode r = nodeDB->resolveLastByte(hint, /*requireDirectNeighbor=*/true);
+            if (r.status == LastByteResolution::Unique) {
+                LOG_TRACE("Next hop for 0x%08x is 0x%x (TMM cache)", to, hint);
+                return hint;
+            }
+            LOG_WARN("TMM next hop 0x%x for 0x%08x %s; set no pref", hint, to,
+                     r.status == LastByteResolution::Ambiguous ? "ambiguous among neighbors" : "not a known neighbor");
+        }
+    }
+#endif
+
     return std::nullopt;
 }
 
@@ -788,7 +493,7 @@ bool NextHopRouter::stopRetransmission(GlobalPacketId key)
         auto p = old->packet;
         /* Only when we already transmitted a packet via LoRa, we will cancel the packet in the Tx queue
           to avoid canceling a transmission if it was ACKed super fast via MQTT */
-        if (old->numRetransmissions < NUM_RELIABLE_RETX - 1) {
+        if (old->numRetransmissions < old->initialNumRetransmissions) {
             // We only cancel it if we are the original sender or if we're not a router(_late)
             if (isFromUs(p) || roleAllowsCancelingFromTxQueue(p)) {
                 // remove the 'original' (identified by originator and packet->id) from the txqueue and free it
@@ -831,7 +536,9 @@ PendingPacket *NextHopRouter::startRetransmission(meshtastic_MeshPacket *p, uint
  */
 int32_t NextHopRouter::doRetransmissions()
 {
-    uint32_t now = millis();
+    // Same clock Throttle reads, so setNextTx() deadlines and this test can't diverge under an
+    // injected test clock.
+    uint32_t now = Time::stampMillis();
     int32_t d = INT32_MAX;
 
     // FIXME, we should use a better datastructure rather than walking through this map.
@@ -842,11 +549,12 @@ int32_t NextHopRouter::doRetransmissions()
 
         bool stillValid = true; // assume we'll keep this record around
 
-        // FIXME, handle 51 day rolloever here!!!
-        if (p.nextTxMsec <= now) {
+        // Judged against the snapshot above, so one pass sees one instant and the 49.7 day wrap
+        // can't stall retransmission.
+        if (Throttle::deadlinePassedAt(now, p.nextTxMsec)) {
             if (p.numRetransmissions == 0) {
                 if (isFromUs(p.packet)) {
-                    LOG_DEBUG("Reliable send failed, returning a nak for fr=0x%x,to=0x%x,id=0x%x", p.packet->from, p.packet->to,
+                    LOG_DEBUG("Reliable send failed, return nak fr=0x%08x,to=0x%08x,id=0x%08x", p.packet->from, p.packet->to,
                               p.packet->id);
                     sendAckNak(meshtastic_Routing_Error_MAX_RETRANSMIT, getFrom(p.packet), p.packet->id, p.packet->channel);
                 }
@@ -854,57 +562,67 @@ int32_t NextHopRouter::doRetransmissions()
                 stopRetransmission(it->first);
                 stillValid = false; // just deleted it
             } else {
-                LOG_DEBUG("Sending retransmission fr=0x%x,to=0x%x,id=0x%x, tries left=%d", p.packet->from, p.packet->to,
+                LOG_DEBUG("Send retransmission fr=0x%08x,to=0x%08x,id=0x%08x, tries left=%d", p.packet->from, p.packet->to,
                           p.packet->id, p.numRetransmissions);
 
                 if (!isBroadcast(p.packet->to)) {
                     if (p.numRetransmissions == 1) {
-                        // Last retransmission: try backup next-hop; if none, fallback to FloodingRouter
-                        RouteEntry rSnapshot;
-                        bool usedBackup = false;
-                        if (lookupRoute(p.packet->to, rSnapshot) && rSnapshot.backup_next_hop != NO_NEXT_HOP_PREFERENCE) {
-                            meshtastic_MeshPacket *tryBackup = retransPacketPool.allocCopy(*p.packet);
-                            if (!tryBackup) tryBackup = packetPool.allocCopy(*p.packet);
-                            if (tryBackup) {
-                                tryBackup->next_hop = rSnapshot.backup_next_hop;
-                                LOG_INFO("Retry final with backup next hop for dest 0x%x -> 0x%x", p.packet->to, tryBackup->next_hop);
-                                NextHopRouter::send(tryBackup);
-                                usedBackup = true;
-                            } else {
-                                LOG_WARN("Pool exhausted for backup retry; skipping backup path");
-                            }
+                        // Last retransmission: this directed delivery went un-ACKed. Record the failure
+                        // (M3 - accumulates across DMs to age out a flapping/dead route) and reset
+                        // next_hop so the final try falls back to FloodingRouter.
+                        noteRouteFailure(p.packet->to);
+                        p.packet->next_hop = NO_NEXT_HOP_PREFERENCE;
+                        // Also reset it in the nodeDB
+                        meshtastic_NodeInfoLite *sentTo = nodeDB->getMeshNode(p.packet->to);
+                        if (sentTo) {
+                            LOG_INFO("Reset next hop for dest 0x%08x", p.packet->to);
+                            sentTo->next_hop = NO_NEXT_HOP_PREFERENCE;
                         }
-                        if (!usedBackup) {
-                            p.packet->next_hop = NO_NEXT_HOP_PREFERENCE;
-                            // Also reset it in the nodeDB
-                            meshtastic_NodeInfoLite *sentTo = nodeDB->getMeshNode(p.packet->to);
-                            if (sentTo) {
-                                LOG_INFO("Resetting next hop for packet with dest 0x%x\n", p.packet->to);
-                                sentTo->next_hop = NO_NEXT_HOP_PREFERENCE;
-                            }
-                            {
-                                auto c = retransPacketPool.allocCopy(*p.packet);
-                                if (!c) c = packetPool.allocCopy(*p.packet);
-                                if (c) FloodingRouter::send(c);
-                                else LOG_WARN("Pool exhausted for flooding retry; skip");
-                            }
+#if HAS_TRAFFIC_MANAGEMENT
+                        if (trafficManagementModule) {
+                            trafficManagementModule->clearNextHop(p.packet->to);
+                        }
+#endif
+                        if (auto *copy = packetPool.allocCopy(*p.packet)) {
+                            if (FloodingRouter::send(copy) == ERRNO_SHOULD_RELEASE)
+                                packetPool.release(copy);
                         }
                     } else {
-                        {
-                            auto c = retransPacketPool.allocCopy(*p.packet);
-                            if (!c) c = packetPool.allocCopy(*p.packet);
-                            if (c) NextHopRouter::send(c);
-                            else LOG_WARN("Pool exhausted for next-hop retry; skip");
+#if NEXTHOP_EARLY_FLOOD_ON_UNVERIFIED
+                        // M4 (gated): if the route isn't proven healthy, don't spend a second directed
+                        // attempt - start flooding one retry sooner to cut recovery latency. A verified
+                        // route (fresh, zero recent failures) keeps the unchanged directed-retry path so
+                        // the sparse-mesh happy path is untouched.
+                        RouteHealth *h = findRouteHealth(p.packet->to);
+                        bool verified = h && h->consecutiveFailures == 0 && !isRouteStale(*h, now);
+                        if (!verified) {
+                            p.packet->next_hop = NO_NEXT_HOP_PREFERENCE;
+                            meshtastic_NodeInfoLite *sentTo = nodeDB->getMeshNode(p.packet->to);
+                            if (sentTo)
+                                sentTo->next_hop = NO_NEXT_HOP_PREFERENCE;
+                            if (auto *copy = packetPool.allocCopy(*p.packet)) {
+                                if (FloodingRouter::send(copy) == ERRNO_SHOULD_RELEASE)
+                                    packetPool.release(copy);
+                            }
+                        } else {
+                            if (auto *copy = packetPool.allocCopy(*p.packet)) {
+                                if (sendWithNextHop(copy, false) == ERRNO_SHOULD_RELEASE)
+                                    packetPool.release(copy);
+                            }
                         }
+#else
+                        if (auto *copy = packetPool.allocCopy(*p.packet)) {
+                            if (sendWithNextHop(copy, false) == ERRNO_SHOULD_RELEASE)
+                                packetPool.release(copy);
+                        }
+#endif
                     }
                 } else {
                     // Note: we call the superclass version because we don't want to have our version of send() add a new
                     // retransmission record
-                    {
-                        auto c = retransPacketPool.allocCopy(*p.packet);
-                        if (!c) c = packetPool.allocCopy(*p.packet);
-                        if (c) FloodingRouter::send(c);
-                        else LOG_WARN("Pool exhausted for flooding retry; skip");
+                    if (auto *copy = packetPool.allocCopy(*p.packet)) {
+                        if (FloodingRouter::send(copy) == ERRNO_SHOULD_RELEASE)
+                            packetPool.release(copy);
                     }
                 }
 
@@ -929,8 +647,102 @@ void NextHopRouter::setNextTx(PendingPacket *pending)
 {
     assert(iface);
     auto d = iface->getRetransmissionMsec(pending->packet);
-    pending->nextTxMsec = millis() + d;
-    LOG_DEBUG("Setting next retransmission in %u msecs: ", d);
+    pending->nextTxMsec = Time::getMillis() + d;
+    LOG_TRACE("Next retransmission in %u msecs", d);
     printPacket("", pending->packet);
     setReceivedMessage(); // Run ASAP, so we can figure out our correct sleep time
+}
+
+// ---------------------------------------------------------------------------
+// M3: RAM route-health table. Bounded array with reuse-oldest eviction (same discipline as
+// PacketHistory). All age comparisons use unsigned subtraction so they survive the 49.7-day millis()
+// rollover. dest == 0 marks an empty slot; learnedAtMsec is normalized to 1 on write so an occupied
+// slot is never read as infinitely old.
+// ---------------------------------------------------------------------------
+
+RouteHealth *NextHopRouter::findRouteHealth(NodeNum dest)
+{
+    if (dest == 0)
+        return nullptr;
+    for (auto &h : routeHealth)
+        if (h.dest == dest)
+            return &h;
+    return nullptr;
+}
+
+RouteHealth *NextHopRouter::getOrAllocRouteHealth(NodeNum dest, uint32_t now)
+{
+    if (dest == 0)
+        return nullptr;
+
+    RouteHealth *oldest = &routeHealth[0];
+    RouteHealth *freeSlot = nullptr;
+    for (auto &h : routeHealth) {
+        if (h.dest == dest)
+            return &h; // existing record
+        if (h.dest == 0) {
+            if (!freeSlot)
+                freeSlot = &h; // remember the first free slot; prefer it over evicting
+            continue;
+        }
+        // Track the oldest occupied slot in case the table is full (rollover-safe).
+        if ((uint32_t)(now - h.learnedAtMsec) > (uint32_t)(now - oldest->learnedAtMsec))
+            oldest = &h;
+    }
+    // Claim the free slot if there is one, else reuse the oldest. Reset before use and stamp the dest
+    // so the record is findable.
+    RouteHealth *slot = freeSlot ? freeSlot : oldest;
+    *slot = RouteHealth{};
+    slot->dest = dest;
+    return slot;
+}
+
+void NextHopRouter::noteRouteLearned(NodeNum dest, uint8_t nextHop, uint32_t now)
+{
+    if (dest == 0 || nextHop == NO_NEXT_HOP_PREFERENCE)
+        return;
+    RouteHealth *h = getOrAllocRouteHealth(dest, now);
+    if (!h)
+        return;
+    // A genuinely new next hop earns a clean slate; re-learning the SAME hop keeps the accumulated
+    // failure count so an asymmetric reverse path that keeps re-teaching a dead forward hop still ages
+    // out instead of resetting the counter every time.
+    if (h->lastNextHop != nextHop) {
+        h->lastNextHop = nextHop;
+        h->consecutiveFailures = 0;
+    }
+    // `now` is a parameter, so guard at the store too: 0 is the empty-slot marker.
+    h->learnedAtMsec = Time::skipZero(now);
+}
+
+void NextHopRouter::noteRouteSuccess(NodeNum dest, uint32_t now)
+{
+    RouteHealth *h = findRouteHealth(dest);
+    if (!h)
+        return; // only routes we actually learned have health to refresh
+    h->consecutiveFailures = 0;
+    h->learnedAtMsec = Time::skipZero(now); // a parameter, so guard at the store too
+}
+
+void NextHopRouter::noteRouteFailure(NodeNum dest)
+{
+    RouteHealth *h = findRouteHealth(dest);
+    if (!h)
+        return; // nothing to penalize (we were flooding, or never learned a route here)
+    if (h->consecutiveFailures < 255)
+        h->consecutiveFailures++;
+}
+
+bool NextHopRouter::isRouteStale(const RouteHealth &h, uint32_t now) const
+{
+    if (h.consecutiveFailures >= ROUTE_FAILURE_THRESHOLD)
+        return true;
+    return (uint32_t)(now - h.learnedAtMsec) >= ROUTE_TTL_MSEC;
+}
+
+void NextHopRouter::clearRouteHealth(NodeNum dest)
+{
+    RouteHealth *h = findRouteHealth(dest);
+    if (h)
+        *h = RouteHealth{};
 }

@@ -14,14 +14,14 @@ permissions:
 jobs:
   semgrep-full:
     if: github.repository == 'meshtastic/firmware'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     container:
       image: semgrep/semgrep
 
     steps:
       # step 1
       - name: clone application source code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       # step 2
       - name: full scan
@@ -29,7 +29,8 @@ jobs:
           semgrep \
             --sarif --output report.sarif \
             --metrics=off \
-            --config="p/default"
+            --config="p/default" \
+            --exclude-rule="yaml.github-actions.security.github-actions-mutable-action-tag.github-actions-mutable-action-tag"
 
       # step 3
       - name: save report as pipeline artifact

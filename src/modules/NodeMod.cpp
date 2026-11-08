@@ -9,20 +9,21 @@
 #include "main.h"
 #include <meshUtils.h>
 
+// hydra: NodeMod ported from the fork (text status / emoji broadcast).
 NodeModModule *nodeModModule;
 
 int32_t NodeModModule::runOnce()
 {
     refreshUptime();
-    
+
     if (firstTime) {
         // First run after boot - send to phone quickly, but wait for radio
         firstTime = false;
-        sendToPhone(true); // Force send to phone on first run
+        sendToPhone(true);
         LOG_INFO("NodeMod: Initialized, sent to phone. Will broadcast to radio in 2-4 min");
-        return (120 + random(120)) * 1000; // 2-4 minutes until first radio broadcast
+        return (120 + random(120)) * 1000;
     }
-    
+
     // Normal operation - send to phone and mesh
     sendToPhone(false);
     sendToMesh(false);
@@ -39,18 +40,20 @@ meshtastic_MeshPacket *NodeModModule::allocReply()
     return NULL;
 }
 
-void NodeModModule::adminChangedStatus(){
+void NodeModModule::adminChangedStatus()
+{
     refreshUptime();
-    sendToPhone(true); // Force immediate send to phone on status change
-    sendToMesh(true);  // Send to mesh with statusChanged=true (has throttle)
+    sendToPhone(true);  // force immediate send to phone on status change
+    sendToMesh(true);   // send to mesh with statusChanged=true (has throttle)
 }
 
-meshtastic_MeshPacket* NodeModModule::preparePacket(){
+meshtastic_MeshPacket *NodeModModule::preparePacket()
+{
     meshtastic_NodeMod nodemod = meshtastic_NodeMod_init_zero;
     strncpy(nodemod.text_status, moduleConfig.node_mod.text_status, sizeof(nodemod.text_status));
 
-    if(strlen(moduleConfig.node_mod.emoji) != 0){
-        nodemod.has_emoji=true;
+    if (strlen(moduleConfig.node_mod.emoji) != 0) {
+        nodemod.has_emoji = true;
         strncpy(nodemod.emoji, moduleConfig.node_mod.emoji, sizeof(nodemod.emoji));
     }
 
@@ -64,29 +67,31 @@ meshtastic_MeshPacket* NodeModModule::preparePacket(){
 void NodeModModule::sendToPhone(bool force)
 {
     // Force send immediately (for status changes), or send if enough time has passed
-    if (force || (lastSentStatsToPhone == 0) || (uptimeLastMs - lastSentStatsToPhone >= 360*1000)) {
-        meshtastic_MeshPacket* packet = preparePacket();
-        service->sendToPhone(packet);    
+    if (force || (lastSentStatsToPhone == 0) || (uptimeLastMs - lastSentStatsToPhone >= 360 * 1000)) {
+        meshtastic_MeshPacket *packet = preparePacket();
+        service->sendToPhone(packet);
         lastSentStatsToPhone = uptimeLastMs;
         LOG_DEBUG("NodeMod: Sent to phone (force=%d)", force);
     }
 }
- 
+
 void NodeModModule::sendToMesh(bool statusChanged)
 {
-    uint32_t baseIntervalMs = Default::getConfiguredOrDefaultMsScaled(0, (default_telemetry_broadcast_interval_secs*1.3), numOnlineNodes);
+    uint32_t baseIntervalMs =
+        Default::getConfiguredOrDefaultMsScaled(0, (default_telemetry_broadcast_interval_secs * 1.3), numOnlineNodes);
     uint32_t statusChangeIntervalMs = Default::getConfiguredOrDefaultMsScaled(0, 300, numOnlineNodes);
 
-    bool allowedByDefault = ((lastSentToMesh == 0) || (((uptimeLastMs - lastSentToMesh) >= baseIntervalMs) && airTime->isTxAllowedAirUtil() && airTime->isTxAllowedChannelUtil(false)));
-    bool allowedDueToStatusChange = (statusChanged == true && ((uptimeLastMs - lastSentToMesh) >= statusChangeIntervalMs) && airTime->isTxAllowedAirUtil() && airTime->isTxAllowedChannelUtil(false));
+    bool allowedByDefault = ((lastSentToMesh == 0) || (((uptimeLastMs - lastSentToMesh) >= baseIntervalMs) &&
+                                                       airTime->isTxAllowedAirUtil() && airTime->isTxAllowedChannelUtil(false)));
+    bool allowedDueToStatusChange = (statusChanged == true && ((uptimeLastMs - lastSentToMesh) >= statusChangeIntervalMs) &&
+                                     airTime->isTxAllowedAirUtil() && airTime->isTxAllowedChannelUtil(false));
 
-    if (allowedByDefault || allowedDueToStatusChange)
-    {
+    if (allowedByDefault || allowedDueToStatusChange) {
         if (strlen(moduleConfig.node_mod.text_status) == 0 && strlen(moduleConfig.node_mod.emoji) == 0) {
             return;
         }
 
-        meshtastic_MeshPacket* packet = preparePacket();
+        meshtastic_MeshPacket *packet = preparePacket();
         packet->priority = meshtastic_MeshPacket_Priority_BACKGROUND;
         service->sendToMesh(packet, RX_SRC_LOCAL, true);
         lastSentToMesh = uptimeLastMs;
