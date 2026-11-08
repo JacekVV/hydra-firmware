@@ -42,6 +42,11 @@ jobs:
 
       - name: Integration test
         run: |
+          # The simulator refuses to start without a MAC address (the runner has no suitable NIC)
+          mkdir -p ~/.portduino/default
+          printf 'General:
+  MACAddress: AA:BB:CC:DD:EE:FF
+' > ~/.portduino/default/config.yaml
           .pio/build/native/meshtasticd & sleep 10 # 5 seconds was not enough
           echo "Simulator started, launching python test..."
           python3 -c 'from meshtastic.test import testSimulator; testSimulator()'
